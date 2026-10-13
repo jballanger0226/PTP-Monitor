@@ -1,0 +1,92 @@
+name: Container image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/ptp-monitor
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python syntax check
+        run: python3 -m py_compile ptp_monitor.py
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Build for this runner and prove the image works before publishing
+      - name: Build test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ptp-monitor:test
+
+      - name: Smoke test
+        run: |
+          set -e
+          docker run -d --name ptp --cap-add NET_RAW --cap-add NET_ADMIN -p 8080:8080 ptp-monitor:test
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8080/api/state >/dev/null && break
+            sleep 1
+          done
+          echo "--- dashboard";   curl -fsS http://127.0.0.1:8080/ | grep -q "PTP Multicast Monitor"
+          echo "--- interfaces";  curl -fsS "http://127.0.0.1:8080/api/interfaces?all=1"; echo
+          echo "--- start capture on eth0 (scapy + libpcap filter inside the image)"
+          curl -fsS -X POST -H 'Content-Type: application/json' \
+               -d '{"interfaces":["eth0"]}' http://127.0.0.1:8080/api/start | tee start.json; echo
+          python3 -c "import json; r=json.load(open('start.json')); assert r['ok'], r"
+          sleep 3
+          curl -fsS http://127.0.0.1:8080/api/state | python3 -c "
+          import json, sys
+          s = json.load(sys.stdin)
+          assert s['running'] and s['active'] == ['eth0'], s['active']
+          m = s['mcast']['ifaces'][0]
+          print('joined per OS:', [(g['group'], g['os']) for g in m['groups']])
+          assert all(g['os'] for g in m['groups']), 'PTP groups not joined'
+          "
+          curl -fsS -o capture.pcap http://127.0.0.1:8080/api/pcap
+          echo "--- pcap"; ls -l capture.pcap
+          docker inspect --format '{{json .State.Health}}' ptp || true
+      - name: Container log
+        if: always()
+        run: docker logs ptp || true
+
+      # Publish (not for pull requests): linux/amd64 + linux/arm64
+      - uses: docker/setup-qemu-action@v3
+        if: github.event_name != 'pull_request'
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        if: github.event_name != 'pull_request'
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=sha
+      - name: Build and push
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

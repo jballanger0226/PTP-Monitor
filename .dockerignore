@@ -1,0 +1,10 @@
+.git
+.github
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.pcap
+*.csv
+.DS_Store
+docker-compose.yml
