@@ -1,0 +1,14 @@
+# PTP Monitor (ptp_monitor.py) - Python 3.8 or newer
+#
+# Install for the same interpreter you run with sudo / as Administrator, e.g.:
+#   python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
+#   sudo ./venv/bin/python ptp_monitor.py
+#
+# Windows also needs Npcap (https://npcap.com/) - it is not a pip package.
+
+# Required: packet capture and decoding (AsyncSniffer needs 2.4.3 or newer)
+scapy>=2.4.3
+
+# Optional: extra way to find each interface's IPv4 address.
+# The program works without it; remove this line if you prefer.
+psutil>=5.6
