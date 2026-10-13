@@ -1,0 +1,23 @@
+# docker compose up -d     then open http://<this host>:8080
+services:
+  ptp-monitor:
+    build: .
+    image: ptp-monitor:latest
+    # or use the published image:
+    # image: ghcr.io/jballanger0226/ptp-monitor:latest
+    container_name: ptp-monitor
+    restart: unless-stopped
+    # Required: capture on the host's real interfaces and join the PTP
+    # multicast groups there. (No "ports:" mapping is needed with host networking.)
+    network_mode: host
+    cap_add:
+      - NET_RAW      # raw packet capture
+      - NET_ADMIN    # promiscuous mode
+    environment:
+      PTP_HOST: "0.0.0.0"     # 127.0.0.1 = reachable from this host only
+      PTP_PORT: "8080"
+      PTP_INTERFACES: ""      # e.g. "eth1" or "eth1,eth2" to start capturing at boot
+      PTP_BUFFER_MB: "128"
+      # PTP_JOIN_DOMAIN: "0"
+      # PTP_TTL: "1"
+      # PTP_IGMP_KEEPALIVE: "1"

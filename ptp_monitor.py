@@ -1959,12 +1959,14 @@ class McastMonitor:
             self.ifs[name] = self._new(name)
 
     def joined(self, name, ip, error):
+        _OSM_CACHE["t"] = 0.0             # memberships changed: re-read the OS table
         with self.lock:
             d = self.ifs.setdefault(name, self._new(name))
             d.update(ip=ip, join_error=error, last_try=time.time(),
                      joined_at=None if error else time.time())
 
     def on_rejoin(self, name, ip, auto, error):
+        _OSM_CACHE["t"] = 0.0
         with self.lock:
             d = self.ifs.setdefault(name, self._new(name))
             now = time.time()
@@ -2054,7 +2056,7 @@ class McastMonitor:
 
     def snapshot(self, active, bpf_has_igmp):
         now = time.time()
-        osm = os_mcast_memberships()
+        osm = os_mcast_memberships() if active else None
         out = []
         with self.lock:
             for name in active:

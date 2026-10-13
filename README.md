@@ -17,6 +17,7 @@ It can also join a PTP domain as a measurement-only slave and chart the clock co
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Quick start](#quick-start)
+- [Running in a container](#running-in-a-container)
 - [Command-line options](#command-line-options)
 - [The dashboard, section by section](#the-dashboard-section-by-section)
 - [Exports](#exports)
@@ -135,6 +136,60 @@ sudo python3 ptp_monitor.py --host 0.0.0.0 --no-browser  # headless box, reach t
 ```
 
 Stop with **Ctrl+C**. The capture stops and the multicast groups are left.
+
+---
+
+## Running in a container
+
+The repository includes a `Dockerfile` and a `docker-compose.yml`. The image contains everything the monitor needs: Python 3.12, scapy, psutil, libpcap and tcpdump.
+
+> **Linux hosts only for real captures.** The container must use **host networking** to see the machine's physical interfaces and join the PTP multicast groups on them. On macOS and Windows, Docker runs inside a virtual machine, so even with host networking the container sees the VM's network, not your Mac's or PC's Ethernet ports. On a Mac, run `ptp_monitor.py` directly as described above.
+
+**With Docker Compose** (from the repository folder):
+
+```bash
+docker compose up -d --build
+# then open http://<host>:8080
+```
+
+**With plain Docker:**
+
+```bash
+docker build -t ptp-monitor .
+docker run -d --name ptp-monitor --restart unless-stopped \
+  --network host --cap-add NET_RAW --cap-add NET_ADMIN \
+  -e PTP_INTERFACES=eth1 \
+  ptp-monitor
+```
+
+**Published image.** The GitHub Actions workflow (`.github/workflows/container.yml`) builds and smoke-tests the image on every pull request. On every push to `main` (and on `v*` tags) it publishes a multi-architecture image (`linux/amd64`, `linux/arm64`) to the GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/jballanger0226/ptp-monitor:latest
+```
+
+The package is private like the repository. Run `docker login ghcr.io` with a token that has `read:packages`, or make the package public in its GitHub settings.
+
+**Configuration** is done with environment variables. Any `ptp_monitor.py` option can also be appended after the image name, for example `docker run … ptp-monitor --ttl 16`; later options win.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PTP_HOST` | `0.0.0.0` | Web UI bind address. With host networking, `127.0.0.1` makes it reachable from the host only. |
+| `PTP_PORT` | `8080` | Web UI port (on the host, because of host networking) |
+| `PTP_INTERFACES` | – | Start capturing right away, e.g. `eth1` or `eth1,eth2`. Leave empty to choose in the web UI. |
+| `PTP_BUFFER_MB` | `128` | Capture buffer size |
+| `PTP_JOIN_DOMAIN` | – | Also join this PTP domain on the first interface |
+| `PTP_TTL` | – | TTL of the Delay_Req packets when joining a domain |
+| `PTP_BPF` | – | Custom capture filter |
+| `PTP_NO_PROMISC` | `0` | `1` = don't use promiscuous mode |
+| `PTP_IGMP_KEEPALIVE` | `1` | `0` = don't re-send IGMP joins when no querier is seen |
+
+Notes:
+- **Privileges:** the container runs as root and needs `NET_RAW` (packet capture) and `NET_ADMIN` (promiscuous mode). It does not need `--privileged`.
+- **Access:** the web UI has no authentication and listens on all addresses by default. Put it on a management network, set `PTP_HOST=127.0.0.1`, or firewall the port.
+- **Health:** a health check polls `/api/state` every 30 s (`docker ps` shows *healthy*).
+- **No browser:** the container never tries to open a browser.
+- **Persistence:** all data lives in memory. Download the `.pcap` or CSV from the web UI to keep it.
 
 ---
 
@@ -353,6 +408,7 @@ curl -s -o capture.pcap http://127.0.0.1:8080/api/pcap
 
 | Problem | What to do |
 |---|---|
+| Container shows no interfaces / no packets | Use `--network host` (`network_mode: host`) and add `NET_RAW` + `NET_ADMIN`. On macOS / Windows Docker Desktop the container can't reach the computer's own Ethernet ports, so run the script directly there. |
 | `This program needs scapy` | Install the requirements for the interpreter you run with `sudo` (see [Installation](#installation)). |
 | `Address already in use` / port busy | Without `--port`, the next free port is used automatically. With an explicit `--port`, pick another one, or find the process: `sudo lsof -nP -iTCP:8080 -sTCP:LISTEN` (often an earlier copy still running). |
 | Browser doesn't open | Open the URL printed in the terminal. Use `--no-browser` on headless systems. |
