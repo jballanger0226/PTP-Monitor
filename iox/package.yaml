@@ -1,0 +1,22 @@
+# OPTIONAL: IOx package descriptor, only for the ioxclient route (see docs/CATALYST-9300.md).
+# IOS XE 16.12+ can install the plain `docker save` tar directly, and then this file is not needed.
+#   ioxclient docker package --skip-envelope-pkg ptp-node:1.0 iox/     (run with this file in the directory)
+descriptor-schema-version: "2.10"
+info:
+  name: ptp_node
+  description: "PTP Monitor remote node"
+  version: "1.0"
+app:
+  type: docker
+  cpuarch: x86_64
+  resources:
+    profile: custom
+    cpu: 1000        # CPU units
+    memory: 256      # MB
+    disk: 100        # MB
+    network:
+      - interface-name: eth0
+      - interface-name: eth1
+  startup:
+    rootfs: rootfs.tar
+    target: ["/app/entrypoint.sh"]

@@ -1,0 +1,41 @@
+# PTP Monitor remote node for Cisco Catalyst 9300 / 9300X (IOS XE Application Hosting)
+#
+# Node only: no web UI, no listening port. It captures PTP on the container's
+# data interface and pushes to the collector over HTTPS.
+#
+# Catalyst 9300/9300X are x86_64, so the image must be linux/amd64:
+#   docker buildx build --platform linux/amd64 -f Dockerfile.iox -t ptp-node:1.0 --load .
+#   docker save ptp-node:1.0 -o ptp-node-1.0.tar          (copy this file to the switch)
+# or run iox/build.sh.  Setup: docs/CATALYST-9300.md
+FROM --platform=linux/amd64 python:3.12-slim
+
+LABEL org.opencontainers.image.title="PTP Monitor node (Catalyst 9300/9300X)" \
+      org.opencontainers.image.description="Remote PTP capture node for Cisco IOS XE Application Hosting" \
+      org.opencontainers.image.source="https://github.com/jballanger0226/PTP-Monitor"
+
+# Small footprint for the switch: 32 MB capture buffer (PTP_BUFFER_MB to change).
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PTP_MODE=node \
+    PTP_BUFFER_MB=32 \
+    PTP_PUSH_INTERVAL=2
+
+# tcpdump brings libpcap (capture filter); iproute2 helps find interface addresses.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends tcpdump iproute2 \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+# scapy + psutil only: the node does not need 'cryptography' (collector-side only).
+RUN pip install "scapy>=2.4.3" "psutil>=5.6"
+
+COPY ptp_monitor.py docker/entrypoint.sh docker/healthcheck.py ./
+RUN chmod 0755 /app/entrypoint.sh /app/ptp_monitor.py
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD ["python", "/app/healthcheck.py"]
+
+# Root inside the container (raw capture); IOx runs it with NET_RAW by default.
+ENTRYPOINT ["/app/entrypoint.sh"]
