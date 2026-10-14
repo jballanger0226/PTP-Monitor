@@ -73,9 +73,9 @@ def minimal_state():
                 announce=dict(rows=[], now=time.time(), events=[]), topology=[])
 
 
-def push(token, state=None, extra=None):
+def push(token, state=None, extra=None, control=True):
     body = gzip.compress(json.dumps(dict(
-        info=dict(proto=1, hostname="ci-node", platform="linux", interval=2.0),
+        info=dict(proto=1, hostname="ci-node", platform="linux", interval=2.0, control=control),
         state=state or minimal_state(), packets=[
             dict(n=1, ts=time.time(), iface="eth1", src="10.0.0.1", dst="224.0.1.129",
                  transport="UDP/319", dscp=46, type="Sync", domain="0", seq=1, log=0,
@@ -153,6 +153,50 @@ def main():
     check("viewer cannot add nodes", st == 403, st)
     st, _, _, _ = v.req("GET", "/admin")
     check("viewer cannot open the admin page", st == 403, st)
+
+    # remote control: join / leave a PTP domain on a node
+    def state_cmds():
+        return a.req("GET", "/api/state?node=ci-node")[1]["collector"]["commands"]
+    st, js, _, _ = v.req("POST", "/api/slave/start?node=ci-node", dict(domain=0, iface="eth1"))
+    check("viewer cannot make a node join a domain", st == 403, (st, js))
+    st, js, _, _ = a.req("POST", "/api/slave/start?node=ci-node", dict(domain=300, iface="eth1"))
+    check("bad domain number refused", st == 400, (st, js))
+    st, js, _, _ = a.req("POST", "/api/slave/start?node=ci-node", dict(domain=0, iface="eth9"))
+    check("interface the node is not capturing on refused", st == 400 and "eth9" in js["error"], (st, js))
+    st, js, _, _ = a.req("POST", "/api/slave/start?node=nope", dict(domain=0, iface="eth1"))
+    check("unknown node refused", st == 404, (st, js))
+    st, js, _, _ = a.req("POST", "/api/slave/start?node=ci-node", dict(domain=1, iface="eth1"))
+    first = (js or {}).get("id")
+    check("admin can queue a join", st == 200 and js.get("queued") and first, (st, js))
+    st, js, _, _ = a.req("POST", "/api/slave/start?node=ci-node", dict(domain=2, iface="eth1", ttl=16, dreq="-3"))
+    second = (js or {}).get("id")
+    st, js, _, _ = push(token)
+    cmds = (js or {}).get("commands", [])
+    check("node gets only the newest join with the next push",
+          len(cmds) == 1 and cmds[0]["id"] == second and cmds[0]["type"] == "slave_start"
+          and cmds[0]["params"]["domain"] == 2 and cmds[0]["params"]["ttl"] == 16, (st, js))
+    cs = {c["id"]: c for c in state_cmds()}
+    check("the older join shows as superseded, the new one as sent",
+          cs[first]["status"] == "superseded" and cs[second]["status"] == "sent", cs)
+    st, js, _, _ = push(token)
+    check("a command is delivered only once", (js or {}).get("commands") == [], js)
+    st, js, _, _ = push(token, extra=dict(results=[dict(id=second, ok=False, error="eth1 has no IPv4 address")]))
+    cs = {c["id"]: c for c in state_cmds()}
+    check("a failure reported by the node is shown", cs[second]["status"] == "failed"
+          and "IPv4" in cs[second]["error"], cs.get(second))
+    st, js, _, _ = a.req("POST", "/api/slave/start?node=ci-node", dict(domain=0, iface="eth1"))
+    third = js["id"]
+    push(token)
+    push(token, extra=dict(results=[dict(id=third, ok=True)]))
+    check("success reported by the node is shown", {c["id"]: c for c in state_cmds()}[third]["status"] == "ok")
+    st, js, _, _ = a.req("POST", "/api/slave/stop?node=ci-node", {})
+    stop_id = js["id"]
+    st, js, _, _ = push(token)
+    check("leave command reaches the node", [c["type"] for c in js["commands"]] == ["slave_stop"], js)
+    st, js, _, _ = push(token, control=False)
+    st, js, _, _ = a.req("POST", "/api/slave/start?node=ci-node", dict(domain=0, iface="eth1"))
+    check("node with remote control switched off cannot be told to join", st == 409, (st, js))
+    push(token, control=True)
 
     # cross-origin and logout
     st, js, _, _ = a.req("POST", "/api/admin/nodes", dict(name="x-origin"), headers={"Origin": "https://evil.example"})

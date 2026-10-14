@@ -23,6 +23,7 @@
 #   PTP_COLLECTOR_FINGERPRINT  pin the collector's (self-signed) certificate, SHA-256
 #   PTP_COLLECTOR_CA           CA file (PEM) that signed the collector's certificate
 #   PTP_PUSH_INTERVAL          seconds between pushes    (default 2)
+#   PTP_NO_REMOTE_CONTROL      1 = the collector may not make this node join a PTP domain
 # collector only (no capture, no special privileges needed):
 #   PTP_HOST            bind address                     (default 0.0.0.0)
 #   PTP_PORT            HTTPS port                       (default 8443)
@@ -62,6 +63,7 @@ case "$MODE" in
     export PTP_NODE_STATUS_FILE="${PTP_NODE_STATUS_FILE:-/tmp/ptp_node_ok}"
     args=(--mode node --push-interval "${PTP_PUSH_INTERVAL:-2}")
     if [[ -n "${PTP_COLLECTOR_URL:-}" ]]; then args+=(--collector-url "$PTP_COLLECTOR_URL"); fi
+    if [[ "${PTP_NO_REMOTE_CONTROL:-0}" =~ ^(1|true|yes)$ ]]; then args+=(--no-remote-control); fi
     capture_args
     ;;
   collector)

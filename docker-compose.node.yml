@@ -25,5 +25,6 @@ services:
       PTP_COLLECTOR_FINGERPRINT: "AA:BB:CC:..."
       # ... or, with your own CA, mount the CA file and use PTP_COLLECTOR_CA instead.
       # PTP_PUSH_INTERVAL: "2"
+      # PTP_NO_REMOTE_CONTROL: "1"     # do not let the collector make this node join a PTP domain
       # PTP_JOIN_DOMAIN: "0"
       # PTP_TTL: "1"

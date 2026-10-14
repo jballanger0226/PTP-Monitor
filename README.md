@@ -215,7 +215,7 @@ For more than one network, run one **collector** and a **node** at each site ins
 | Web UI | HTTP, no login | **none** | **HTTPS, local user login** |
 | Listens on a port | 8080 | **none** (connects out) | 8443 |
 
-Standalone is unchanged: everything described elsewhere in this README still applies to it. The node runs the same capture and analysis, so each node's dashboard on the collector is the **same page** you get standalone (charts, hosts, BMCA ranking, hierarchy, Delay_Req check, IGMP membership, joined-domain measurement), with a bar on top that shows the node and whether it is online. The page is read-only there: you start, stop and configure a capture on the node itself.
+Standalone is unchanged: everything described elsewhere in this README still applies to it. The node runs the same capture and analysis, so each node's dashboard on the collector is the **same page** you get standalone (charts, hosts, BMCA ranking, hierarchy, Delay_Req check, IGMP membership, joined-domain measurement), with a bar on top that shows the node and whether it is online. The capture itself (interfaces, start/stop, buffer) is controlled on the node, but an admin can make the node **join a PTP domain** from the collector (see [Joining a PTP domain from the collector](#joining-a-ptp-domain-from-the-collector)).
 
 ### Set up the collector
 
@@ -269,11 +269,21 @@ The node connects **outbound** only (it works behind NAT and firewalls, and need
 
 The node refuses `http://` URLs, so its token is never sent unencrypted. The token can also be given in the `PTP_NODE_TOKEN` environment variable, which keeps it out of the process list (`--token TOKEN` exists but is visible there).
 
+### Joining a PTP domain from the collector
+
+On a node's dashboard, admins get the same "Participate in a PTP domain" form as in standalone mode (domain, interface, Delay_Req rate, multicast/unicast, TTL, timescale, pinned master). **Join domain** makes the *node* a slave-only ordinary clock in that domain, and the node's measurement shows up on the collector's page exactly as it does standalone: the time the grandmaster gives, the correction and path-delay charts with the mean ± 2σ band, and the statistics table. **Leave** ends it. Viewers see the measurement but not the form.
+
+- The interface list is the interfaces the node is **already capturing on** (the slave needs the capture's packet timestamps), so start the node with `-i` for that interface.
+- A command waits on the collector until the node's next push, which is how it reaches a node that only connects out. Expect the node to join within about one push interval (2 s by default); the page says "sent to the node, waiting" and then shows the result or the error the node reported.
+- Only two commands exist (join and leave), both checked again on the node. A node can refuse them altogether with `--no-remote-control` (`PTP_NO_REMOTE_CONTROL=1`); the form then reports that remote control is switched off. Joining makes the node send Delay_Req packets, so enable it only where that is acceptable.
+- Measurement only: the node's clock is never adjusted, as in standalone mode. A node that restarts is no longer in the domain; give it `--join-domain N` if it should join at every start.
+- The commands and their outcomes are logged on the collector (who told which node to do what) and on the node.
+
 ### Reading the collector
 
 - **Nodes** page: one row per node with status (online, offline, capture stopped, never connected), when data last arrived, the interfaces it captures on, the grandmaster per domain, hosts sending Sync and the message rate, plus totals over all online nodes.
 - Click a node for its **full dashboard**. If a node stops reporting, the page keeps showing its last known state with an "offline" banner. A node is offline after missing about three pushes (at least 10 s).
-- The Delay_Req **CSV** download works per node. The `.pcap` download and the capture controls (start, stop, clear, buffer size, IGMP re-join, joining a domain) are **not** available on the collector, because the raw packets stay on the node. For a `.pcap`, open the node's own standalone dashboard or capture on the node.
+- The Delay_Req **CSV** download works per node. The `.pcap` download and the capture controls (start, stop, clear, buffer size, IGMP re-join) are **not** available on the collector, because the raw packets stay on the node. For a `.pcap`, open the node's own standalone dashboard or capture on the node.
 - The packet list shows the most recent 200 packets of the node, filtered on the collector.
 
 ### Containers
@@ -288,6 +298,7 @@ The same image runs all three modes (`PTP_MODE=standalone|node|collector`); see 
 | `PTP_COLLECTOR_FINGERPRINT` / `PTP_COLLECTOR_CA` | node | how to trust the collector's certificate (see above) |
 | `PTP_INTERFACES` | node | interfaces to capture on, e.g. `eth1` (**required**) |
 | `PTP_PUSH_INTERVAL` | node | seconds between pushes (default 2) |
+| `PTP_NO_REMOTE_CONTROL` | node | `1` = the collector may not make this node join a PTP domain |
 | `PTP_HOST` / `PTP_PORT` | collector | bind address and HTTPS port (default `0.0.0.0:8443`) |
 | `PTP_DATA_DIR` | collector | accounts, tokens and generated certificate (default `/data`; keep it on a volume) |
 | `PTP_CERT` / `PTP_KEY` | collector | your own certificate and key (PEM, paths inside the container) |
@@ -301,8 +312,8 @@ The health check follows the mode: the collector answers `/healthz`; a node is h
 
 - HTTPS only (TLS 1.2 or newer). There is no plain-HTTP listener. The session cookie is `Secure`, `HttpOnly` and `SameSite=Strict`, and the pages are sent with HSTS, a Content-Security-Policy and `X-Frame-Options: DENY`.
 - Sessions are server side: logging out, deleting a user or changing a password ends them at once. POST requests must be JSON from the same origin, which stops other sites from acting on a logged-in browser.
-- A node's name comes from its token, not from what the node says, so one node cannot pose as another. A node can only push data; it cannot read anything or log in. Treat a node token like a password: whoever has it can send data under that node's name (use **New token** if one leaks). The collector shows what nodes send like any dashboard data, so only register nodes you trust.
-- The collector has no capture or control endpoints at all and does not need root: run it as an unprivileged user (port 8443 is above 1024).
+- A node's name comes from its token, not from what the node says, so one node cannot pose as another. A node can only push data (and receive the join/leave commands an admin sends it); it cannot read anything or log in. Only admins can send those commands, and a node can switch them off with `--no-remote-control`. Treat a node token like a password: whoever has it can send data under that node's name (use **New token** if one leaks). The collector shows what nodes send like any dashboard data, so only register nodes you trust.
+- The collector has no capture endpoints (its only control is the admin-only join/leave command for nodes) and does not need root: run it as an unprivileged user (port 8443 is above 1024).
 - The first-start password, `--admin-password` and `--token` are visible in the process list or logs; prefer the environment variables, a token file and changing the first password at once.
 - Limits: pushes over 8 MB (compressed) or 64 MB (decompressed) are refused.
 
@@ -335,6 +346,7 @@ The health check follows the mode: the collector answers `/healthz`; a node is h
 | `--collector-ca FILE` | – | CA certificate (PEM) that signed the collector's certificate. |
 | `--insecure-skip-verify` | off | Do not verify the collector's certificate (testing only). |
 | `--push-interval SEC` | `2` | Seconds between pushes. |
+| `--no-remote-control` | off | Do not let the collector make this node join or leave a PTP domain (also `PTP_NO_REMOTE_CONTROL=1`). |
 
 **Collector mode** (`--mode collector`; no capture options apply):
 
@@ -496,7 +508,7 @@ One memory limit covers everything stored per packet: the raw frames for the .pc
 
 ## HTTP API
 
-This is the API of a **standalone** program. (The collector serves the same `/api/state`, `/api/packets` and `/api/dreq.csv` read-only for each node with a `?node=NAME` parameter, behind the login, and has none of the control endpoints.)
+This is the API of a **standalone** program. (The collector serves the same `/api/state`, `/api/packets` and `/api/dreq.csv` read-only for each node with a `?node=NAME` parameter, behind the login. Its only control endpoints are the admin-only `POST /api/slave/start` and `/api/slave/stop` (`?node=NAME`), which queue a join/leave for the node.)
 
 The page is driven by a small JSON API, which you can also use from scripts. POST requests must send `Content-Type: application/json`.
 
@@ -545,7 +557,7 @@ curl -s -o capture.pcap http://127.0.0.1:8080/api/pcap
 - **IPv4 multicast join.** The IGMP join covers the IPv4 groups. IPv6 PTP (FF0x::181) and Layer-2 PTP are captured only if they reach the interface anyway, for example in promiscuous mode or on a span port.
 - **Visibility.** The hierarchy and Delay_Req check only see traffic that reaches the chosen interface(s). Masters on other segments appear as "upstream not visible", and switches with IGMP snooping may hide some traffic.
 - **Memory.** All data lives in memory; nothing is written to disk unless you download it. (The collector also keeps its accounts and node tokens on disk, and the latest data of each node in memory only, so a collector restart shows nodes empty until their next push.)
-- **Collector view.** It shows each node's latest state, not a history; it has no `.pcap` download and no capture controls (see [Reading the collector](#reading-the-collector)). Node data crosses the network only as the dashboard summary plus the latest 200 packets. The node's clock and the collector's clock are not compared: times in tables are the node's.
+- **Collector view.** It shows each node's latest state, not a history; it has no `.pcap` download and no capture controls (apart from joining/leaving a PTP domain) (see [Reading the collector](#reading-the-collector)). Node data crosses the network only as the dashboard summary plus the latest 200 packets. The node's clock and the collector's clock are not compared: times in tables are the node's.
 
 ---
 
@@ -556,6 +568,7 @@ curl -s -o capture.pcap http://127.0.0.1:8080/api/pcap
 | Container shows no interfaces / no packets | Use `--network host` (`network_mode: host`) and add `NET_RAW` + `NET_ADMIN`. On macOS / Windows Docker Desktop the container can't reach the computer's own Ethernet ports, so run the script directly there. |
 | Node: `Cannot send to the collector (… CERTIFICATE_VERIFY_FAILED …)` | The collector's certificate is not trusted. For a self-signed one, give the node `--collector-fingerprint` (shown at collector start-up and on the Admin page); for your own CA use `--collector-ca`. Also check that the URL's host name is in the certificate (`--tls-san` when the collector creates it). |
 | Node: `the collector refused this node's token (HTTP 401)` | The token is wrong, was replaced (**New token**) or the node was removed. Copy the current token from the Admin page. |
+| Collector: joining a domain says "failed" or "did not confirm" | The message is the node's own answer, for example "Start the capture on eth1 first" or "eth1 has no IPv4 address, cannot send Delay_Req". "The node is offline" means it has stopped pushing. "Remote control is switched off" means the node runs with `--no-remote-control`. |
 | Node: `Connection refused` / timeout | The collector is not running, the URL or port is wrong, or a firewall blocks outbound 8443. The node retries by itself. |
 | Node shows "never connected" or "offline" on the collector | Check the node's console output. A node without a working capture (not root, wrong interface name) still connects but shows "capture stopped". |
 | Forgot the collector's admin password | On the collector host: `python3 ptp_monitor.py --mode collector --data-dir DIR --set-password admin`. |

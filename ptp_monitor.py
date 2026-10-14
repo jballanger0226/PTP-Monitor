@@ -1399,6 +1399,41 @@ BUFFER = CaptureBuffer()
 # --------------------------------------------------------------------------
 # Optional PTP participation: slave-only ordinary clock, end-to-end delay
 # --------------------------------------------------------------------------
+def parse_slave_request(body):
+    """Validate a "join a PTP domain" request (from the web page, or from the
+    collector for a remote node).  Returns the slave configuration or raises
+    ValueError with a message for the user."""
+    if not isinstance(body, dict):
+        raise ValueError("Bad request")
+    try:
+        domain = int(body.get("domain", 0))
+        if not 0 <= domain <= 127:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError("Domain must be a number from 0 to 127")
+    iface = str(body.get("iface", ""))
+    dreq = str(body.get("dreq", "auto"))
+    if dreq not in ("auto", "sync"):
+        try:
+            if not -7 <= int(dreq) <= 7:
+                raise ValueError
+        except ValueError:
+            raise ValueError("Bad Delay_Req rate")
+    force = str(body.get("force_master", "") or "").strip()
+    if force and not _valid_ip(force):
+        raise ValueError("'Only follow master IP' is not a valid IPv4 address")
+    try:
+        ttl = int(body.get("ttl", 1))
+        if not 1 <= ttl <= MAX_TTL:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError("TTL must be a whole number from 1 to %d" % MAX_TTL)
+    return dict(domain=domain, iface=iface, dreq=dreq, ttl=ttl,
+                unicast=bool(body.get("unicast")),
+                timescale="tai" if body.get("timescale") == "tai" else "utc",
+                force_master=force)
+
+
 class Slave:
     """Follows the best master in one domain, sends Delay_Req after Sync and
     records offset / path delay.  Timestamps are the capture (pcap) timestamps
@@ -1441,32 +1476,9 @@ class Slave:
     # -- control ------------------------------------------------------------
     def start_from_request(self, body):
         try:
-            domain = int(body.get("domain", 0))
-            if not 0 <= domain <= 127:
-                raise ValueError
-        except (TypeError, ValueError):
-            return dict(ok=False, error="Domain must be a number from 0 to 127")
-        iface = str(body.get("iface", ""))
-        dreq = str(body.get("dreq", "auto"))
-        if dreq not in ("auto", "sync"):
-            try:
-                if not -7 <= int(dreq) <= 7:
-                    raise ValueError
-            except ValueError:
-                return dict(ok=False, error="Bad Delay_Req rate")
-        force = str(body.get("force_master", "") or "").strip()
-        if force and not _valid_ip(force):
-            return dict(ok=False, error="'Only follow master IP' is not a valid IPv4 address")
-        try:
-            ttl = int(body.get("ttl", 1))
-            if not 1 <= ttl <= MAX_TTL:
-                raise ValueError
-        except (TypeError, ValueError):
-            return dict(ok=False, error="TTL must be a whole number from 1 to %d" % MAX_TTL)
-        cfg = dict(domain=domain, iface=iface, dreq=dreq, ttl=ttl,
-                   unicast=bool(body.get("unicast")),
-                   timescale="tai" if body.get("timescale") == "tai" else "utc",
-                   force_master=force)
+            cfg = parse_slave_request(body)
+        except ValueError as e:
+            return dict(ok=False, error=str(e))
         return self.start(cfg)
 
     def start(self, cfg):
@@ -2777,7 +2789,7 @@ let running=false,slRunning=false,sIfaceTouched=false;
 
 const NODE=window.PTP_NODE||'';        // collector only: the node whose data is shown
 async function api(path,body){
-  if(NODE&&body===undefined)path+=(path.includes('?')?'&':'?')+'node='+encodeURIComponent(NODE);
+  if(NODE)path+=(path.includes('?')?'&':'?')+'node='+encodeURIComponent(NODE);
   const o=body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)};
   const r=await fetch(path,o);
   if(r.status===401){location.href='/login';throw new Error('login required')}
@@ -3427,6 +3439,7 @@ class CollectorStore:
         self._last_purge = time.time()
         self.fails = {}                       # throttle key -> [timestamps]
         self.live = {}                        # node -> dict(state, packets, ...)
+        self.cmd_log = {}                     # node -> recent remote commands (memory only)
         self._load(force=True)
 
     # -- files ---------------------------------------------------------------
@@ -3673,6 +3686,7 @@ class CollectorStore:
             self.nodes[name]["rotated"] = int(time.time())
             self._save("nodes")
             self.live.pop(name, None)             # the old sender is no longer trusted
+            self.cmd_log.pop(name, None)
         return tok
 
     def delete_node(self, name):
@@ -3683,6 +3697,7 @@ class CollectorStore:
             del self.nodes[name]
             self._save("nodes")
             self.live.pop(name, None)
+            self.cmd_log.pop(name, None)
 
     def node_for_token(self, tok):
         if not tok or len(tok) > 200:
@@ -3695,6 +3710,58 @@ class CollectorStore:
                 if hmac.compare_digest(rec["token_hash"], h):
                     found = name
         return found
+
+    # -- remote commands: queued here, delivered in the answer to the node's next push --
+    CMD_LOG_LEN = 20
+    CMD_PICKUP_SECS = 60           # a node that does not pick a command up in this time
+    CMD_CONFIRM_SECS = 30          # ... or does not report its outcome in this time
+
+    def queue_command(self, name, ctype, params, by):
+        with self.lock:
+            log_ = self.cmd_log.setdefault(name, [])
+            if ctype.startswith("slave_"):          # the newest join/leave wins
+                for c in log_:
+                    if c["status"] == "queued" and c["type"].startswith("slave_"):
+                        c["status"], c["error"] = "superseded", "replaced by a newer command"
+            rec = dict(id=secrets.token_hex(6), type=ctype, params=params, by=by,
+                       ts=time.time(), status="queued", error="")
+            log_.append(rec)
+            del log_[:-self.CMD_LOG_LEN]
+            return rec["id"]
+
+    def take_commands(self, name, limit=5):
+        """The queued commands for a node, now handed over (marked 'sent')."""
+        now = time.time()
+        out = []
+        with self.lock:
+            for c in self.cmd_log.get(name, []):
+                if c["status"] == "queued" and len(out) < limit:
+                    c["status"], c["sent"] = "sent", now
+                    out.append(dict(id=c["id"], type=c["type"], params=c["params"]))
+        return out
+
+    def report_results(self, name, results):
+        with self.lock:
+            by_id = {c["id"]: c for c in self.cmd_log.get(name, [])}
+            for r in results:
+                c = by_id.get(r.get("id"))
+                if c is not None and c["status"] == "sent":
+                    c["status"] = "ok" if r.get("ok") else "failed"
+                    c["error"] = str(r.get("error", ""))[:300]
+
+    def commands_view(self, name, n=5):
+        now = time.time()
+        with self.lock:
+            log_ = self.cmd_log.get(name, [])
+            for c in log_:
+                if c["status"] == "queued" and now - c["ts"] > self.CMD_PICKUP_SECS:
+                    c["status"], c["error"] = "timeout", "the node did not pick the command up"
+                elif c["status"] == "sent" and now - c["sent"] > self.CMD_CONFIRM_SECS:
+                    c["status"], c["error"] = "timeout", "the node did not confirm the command"
+            return [dict(id=c["id"], type=c["type"], by=c["by"], ts=c["ts"],
+                         status=c["status"], error=c["error"],
+                         label=command_label(c["type"], c["params"]))
+                    for c in log_[-n:]]
 
     def update_live(self, name, state, packets, info, remote):
         now = time.time()
@@ -3714,6 +3781,14 @@ class CollectorStore:
 
 STORE = None
 CFG = {}                    # collector settings (fingerprint, ...)
+
+
+def command_label(ctype, params):
+    if ctype == "slave_start":
+        return "Join domain %s on %s" % (params.get("domain"), params.get("iface"))
+    if ctype == "slave_stop":
+        return "Leave the domain"
+    return ctype
 
 
 def is_online(live):
@@ -4110,7 +4185,8 @@ class CollectorHandler(BaseHTTPRequestHandler):
             out["collector"] = dict(node=name, online=is_online(live),
                                     age=time.time() - live["received"],
                                     remote=live.get("remote"),
-                                    info=live.get("info") or {}, pushes=live["pushes"])
+                                    info=live.get("info") or {}, pushes=live["pushes"],
+                                    commands=STORE.commands_view(name))
             return self._json(200, out)
         if path == "/api/packets":
             try:
@@ -4141,7 +4217,8 @@ class CollectorHandler(BaseHTTPRequestHandler):
     # -- POST ----------------------------------------------------------------
     def do_POST(self):
         self._consumed = False
-        path = urlparse(self.path).path
+        u = urlparse(self.path)
+        path, q = u.path, parse_qs(u.query)
         if path == "/api/node/push":
             return self._node_push()
         if not self._same_origin():
@@ -4161,6 +4238,8 @@ class CollectorHandler(BaseHTTPRequestHandler):
             return self._change_own_password(s, body)
         if s["must_change"]:
             return self._fail(403, "You must change your password first")
+        if path in ("/api/slave/start", "/api/slave/stop"):
+            return self._slave_command(path, q, body, s)
         if not path.startswith("/api/admin/"):
             return self._fail(404, "not found")
         if s["role"] != "admin":
@@ -4169,6 +4248,38 @@ class CollectorHandler(BaseHTTPRequestHandler):
             self._admin(path[len("/api/admin/"):].strip("/").split("/"), body, s)
         except ValueError as e:
             self._json(400, dict(ok=False, error=str(e)))
+
+    def _slave_command(self, path, q, body, s):
+        """Tell a node to join / leave a PTP domain.  The command waits here until
+        the node's next push, which is when the node can be reached."""
+        if s["role"] != "admin":
+            return self._fail(403, "Only admins can control a node")
+        name = self._qs(q, "node")
+        live = STORE.get_live(name) if NODE_NAME_RE.match(name) else None
+        if not live:
+            return self._json(404, dict(ok=False, error="No data from that node yet"))
+        if not is_online(live):
+            return self._json(409, dict(ok=False, error="The node is offline, so it cannot "
+                                                        "be told to do anything"))
+        if not (live.get("info") or {}).get("control"):
+            return self._json(409, dict(ok=False, error="Remote control is switched off on "
+                                        "this node (it runs with --no-remote-control)"))
+        if path.endswith("/start"):
+            try:
+                cfg = parse_slave_request(body)
+            except ValueError as e:
+                return self._json(400, dict(ok=False, error=str(e)))
+            active = live["state"].get("active") or []
+            if cfg["iface"] not in active:
+                return self._json(400, dict(ok=False, error="%s is not capturing on this node "
+                                  "(capturing on: %s)" % (cfg["iface"] or "That interface",
+                                                          ", ".join(active) or "nothing")))
+            cid = STORE.queue_command(name, "slave_start", cfg, s["user"])
+            log("%s told node %s to join domain %d on %s" % (s["user"], name, cfg["domain"], cfg["iface"]))
+        else:
+            cid = STORE.queue_command(name, "slave_stop", {}, s["user"])
+            log("%s told node %s to leave its domain" % (s["user"], name))
+        self._json(200, dict(ok=True, queued=True, id=cid))
 
     def _cookie(self, value, max_age):
         return "%s=%s; Path=/; Max-Age=%d; HttpOnly; Secure; SameSite=Strict" % (COOKIE, value, max_age)
@@ -4287,8 +4398,13 @@ class CollectorHandler(BaseHTTPRequestHandler):
                                        "speaks %d)" % (info.get("proto"), PROTO))
         except Exception as e:
             return self._fail(400, "bad push: %s" % e)
+        results = data.get("results", [])
+        if isinstance(results, list):
+            STORE.report_results(name, [r for r in results[:20] if isinstance(r, dict)
+                                        and isinstance(r.get("id"), str)])
         STORE.update_live(name, st, packets, info, self._ip())
-        self._json(200, dict(ok=True, server_time=time.time()))
+        self._json(200, dict(ok=True, server_time=time.time(),
+                             commands=STORE.take_commands(name)))
 
 
 def html_escape(s):
@@ -4314,9 +4430,12 @@ def shell_page(title, body, script, session):
 # ---- the node: push this instance's dashboard data to the collector ------------
 class NodePusher(threading.Thread):
     def __init__(self, url, token, interval=2.0, ca=None, fingerprint=None,
-                 insecure=False, status_file=None):
+                 insecure=False, status_file=None, allow_control=True):
         super().__init__(daemon=True, name="node-push")
         self.status_file = status_file      # touched after every accepted push
+        self.allow_control = allow_control  # may the collector have us join a domain?
+        self.results = []                   # outcomes of remote commands, sent with the next push
+        self.fast = False                   # push again at once (after running a command)
         u = urlparse(url if "://" in url else "https://" + url)
         if u.scheme != "https" or not u.hostname:
             raise ValueError("--collector-url must be an https:// URL")
@@ -4362,12 +4481,36 @@ class NodePusher(threading.Thread):
     def _payload(self):
         info = dict(proto=PROTO, hostname=socket.gethostname(), platform=sys.platform,
                     python=sys.version.split()[0], interval=self.interval,
-                    started=self.started)
+                    started=self.started, control=self.allow_control)
         return dict(info=info, state=build_state(300),
-                    packets=STATS.query_packets(PUSH_PACKETS, "", ""))
+                    packets=STATS.query_packets(PUSH_PACKETS, "", ""),
+                    results=list(self.results))
+
+    def _run_command(self, cmd):
+        """Carry out one command from the collector.  Only these two exist, both
+        validated again here: the node never takes the collector's word for it."""
+        cid = str(cmd.get("id", ""))[:32]
+        ctype, params = cmd.get("type"), cmd.get("params")
+        if not self.allow_control:
+            return dict(id=cid, ok=False, error="Remote control is switched off on this node")
+        try:
+            if ctype == "slave_start":
+                r = SLAVE.start_from_request(params if isinstance(params, dict) else {})
+                what = "join domain %s on %s" % ((params or {}).get("domain"), (params or {}).get("iface"))
+            elif ctype == "slave_stop":
+                SLAVE.stop()
+                r, what = dict(ok=True), "leave the domain"
+            else:
+                return dict(id=cid, ok=False, error="Unknown command")
+        except Exception as e:
+            return dict(id=cid, ok=False, error="%s: %s" % (type(e).__name__, e))
+        log("Command from the collector: %s -> %s" % (what, "done" if r.get("ok") else r.get("error")))
+        return dict(id=cid, ok=bool(r.get("ok")), error=r.get("error", ""))
 
     def push_once(self):
-        body = gzip.compress(json.dumps(self._payload()).encode(), 5)
+        payload = self._payload()
+        sent = len(payload["results"])
+        body = gzip.compress(json.dumps(payload).encode(), 5)
         hdr = {"Authorization": "Bearer " + self.token, "Content-Type": "application/json",
                "Content-Encoding": "gzip", "User-Agent": "ptp-monitor-node/%d" % PROTO}
         for attempt in (1, 2):                 # a kept-alive connection may have gone stale
@@ -4394,6 +4537,14 @@ class NodePusher(threading.Thread):
             except Exception:
                 msg = ""
             raise RuntimeError("collector answered HTTP %d %s" % (r.status, msg))
+        del self.results[:sent]                      # the collector has these outcomes now
+        try:
+            cmds = json.loads(data).get("commands") or []
+        except Exception:
+            cmds = []
+        for cmd in [c for c in cmds if isinstance(c, dict)][:10]:
+            self.results.append(self._run_command(cmd))
+            self.fast = True
 
     def run(self):
         wait_extra = 0.0
@@ -4423,7 +4574,11 @@ class NodePusher(threading.Thread):
                     log("Cannot send to the collector (%s) - retrying" % msg, True)
                 self.ok, self.last_err = False, msg
                 wait_extra = 30.0 if isinstance(e, PermissionError) else min(max(wait_extra * 2, 2.0), 30.0)
-            self.stop_evt.wait(max(0.2, self.interval - (time.time() - t0)) + wait_extra)
+            if self.fast and self.ok:
+                self.fast = False                   # report a command's outcome promptly
+                self.stop_evt.wait(0.3)
+            else:
+                self.stop_evt.wait(max(0.2, self.interval - (time.time() - t0)) + wait_extra)
 
     def stop(self):
         self.stop_evt.set()
@@ -4450,13 +4605,14 @@ def run_node(a):
     try:
         pusher = NodePusher(a.collector_url, token, a.push_interval, a.collector_ca,
                             a.collector_fingerprint, a.insecure_skip_verify,
-                            a.status_file)
+                            a.status_file, not a.no_remote_control)
     except (ValueError, OSError, ssl.SSLError) as e:
         sys.exit("ERROR: %s" % e)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     pusher.start()
-    log("PTP Monitor node: capturing on %s, sending to https://%s:%d"
-        % (", ".join(a.interface), pusher.host, pusher.port))
+    log("PTP Monitor node: capturing on %s, sending to https://%s:%d%s"
+        % (", ".join(a.interface), pusher.host, pusher.port,
+           "" if pusher.allow_control else " (remote control off)"))
     try:
         while True:
             if not CAP.running:                  # e.g. the interface was not up yet
@@ -4904,13 +5060,18 @@ COLLECTOR_BAR = r"""<style>
 
 COLLECTOR_JS = r"""
 (function(){
-  // read-only view: the capture is controlled on the node itself
-  ['ifaces','ifHint','bStart','bStop','bClear','bPcap','bRefresh','bBuf','bRejoin','pcapInfo','bJoin','bLeave']
+  // The capture itself is controlled on the node. What an admin can do from here is
+  // make the node join / leave a PTP domain (the commands travel with the node's pushes).
+  const admin=!!(window.PTP_USER&&window.PTP_USER.role==='admin');
+  ['ifaces','ifHint','bStart','bStop','bClear','bPcap','bRefresh','bBuf','bRejoin','pcapInfo']
     .forEach(id=>{const e=$(id);if(e)e.style.display='none'});
   ['showAll','bufMb','mcKeep'].forEach(id=>{const e=$(id);if(e&&e.parentElement)e.parentElement.style.display='none'});
-  document.querySelectorAll('#slaveCard .form,#slaveCard>.sub').forEach(e=>e.style.display='none');
+  if(!admin)document.querySelectorAll('#slaveCard .form,#slaveCard>.sub,#bJoin,#bLeave').forEach(e=>e.style.display='none');
   const h1=document.querySelector('.card h2');if(h1)h1.textContent='Capture on this node';
-  const h2=document.querySelector('#slaveCard h2');if(h2)h2.textContent='PTP domain measurement on this node (read-only here)';
+  const h2=document.querySelector('#slaveCard h2');
+  if(h2)h2.textContent=admin?'2. Make this node participate in a PTP domain (optional)':'PTP domain measurement on this node (view only)';
+  const sub=document.querySelector('#slaveCard>.sub');
+  if(sub&&admin)sub.innerHTML='The <b>node</b> acts as a slave-only ordinary clock: it follows the best Announce in the domain, sends a Delay_Req after Sync messages and measures the correction needed to match the master (correction = &minus;offset from master). Measurement only &ndash; the node&rsquo;s clock is never adjusted. The command reaches the node with its next push (a few seconds); the node must be capturing on the chosen interface.';
   $('cNode').textContent=NODE;
   if(!window.PTP_USER||window.PTP_USER.role!=='admin')$('cAdmin').style.display='none';
   $('cOut').onclick=async e=>{e.preventDefault();
@@ -4918,7 +5079,23 @@ COLLECTOR_JS = r"""
     location.href='/login'};
   loadIfaces=async function(){};
   const baseRender=render;
-  render=function(s){baseRender(s);bar(s)};
+  render=function(s){baseRender(s);bar(s);fillIfaces(s);cmdStatus(s)};
+  // the interfaces to choose from are the ones the node is capturing on
+  function fillIfaces(s){
+    const ss=$('sIface'),act=s.active||[],key=act.join(',');
+    if(ss.dataset.opts!==key){const cur=ss.value;
+      ss.innerHTML=act.map(i=>`<option value="${esc(i)}">${esc(i)}</option>`).join('');ss.dataset.opts=key;
+      if(act.includes(cur))ss.value=cur}
+    if(!sIfaceTouched){const c=s.slave&&s.slave.running&&s.slave.cfg&&s.slave.cfg.iface;if(c&&act.includes(c))ss.value=c}
+  }
+  // outcome of the last command sent to the node
+  function cmdStatus(s){
+    const cs=(s.collector&&s.collector.commands)||[];const c=cs[cs.length-1];
+    if(!c||Date.now()/1000-c.ts>120)return;
+    const m=$('sMsg');
+    if(c.status==='queued'||c.status==='sent'){m.className='msg';m.style.color='var(--muted)';m.textContent=c.label+' – sent to the node, waiting for it…'}
+    else if(c.status==='failed'||c.status==='timeout'){m.className='msg';m.style.color='';m.textContent=c.label+' – failed: '+c.error}
+  }
   function bar(s){
     const c=s.collector||{},online=!!c.online,age=Math.floor(c.age||0),i=c.info||{};
     const p=$('cPill');
@@ -5029,6 +5206,10 @@ def main():
                    help="do not verify the collector's certificate at all (not recommended)")
     g.add_argument("--push-interval", type=float, default=2.0, metavar="SEC",
                    help="seconds between pushes to the collector (default 2)")
+    g.add_argument("--no-remote-control", action="store_true",
+                   default=os.environ.get("PTP_NO_REMOTE_CONTROL", "0").lower() in ("1", "true", "yes"),
+                   help="do not let the collector make this node join or leave a PTP domain "
+                        "(it can then only be read)")
     g.add_argument("--status-file", metavar="FILE", default=os.environ.get("PTP_NODE_STATUS_FILE"),
                    help="touch this file after every push the collector accepted "
                         "(used by the container health check)")
