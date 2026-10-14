@@ -308,6 +308,10 @@ The same image runs all three modes (`PTP_MODE=standalone|node|collector`); see 
 
 The health check follows the mode: the collector answers `/healthz`; a node is healthy while the collector keeps accepting its pushes.
 
+### Running a node on a Catalyst 9300 / 9300X
+
+A node-only image (`Dockerfile.iox`, linux/amd64, small footprint) is provided for Cisco IOS XE Application Hosting. Build it with `iox/build.sh 1.0` and follow [docs/CATALYST-9300.md](docs/CATALYST-9300.md) for the switch configuration, install, collector connectivity and troubleshooting. It has not yet been tested on physical hardware.
+
 ### Security of the collector
 
 - HTTPS only (TLS 1.2 or newer). There is no plain-HTTP listener. The session cookie is `Secure`, `HttpOnly` and `SameSite=Strict`, and the pages are sent with HSTS, a Content-Security-Policy and `X-Frame-Options: DENY`.

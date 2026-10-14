@@ -80,3 +80,54 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  # Node image for Cisco Catalyst 9300/9300X (IOS XE Application Hosting): linux/amd64 only
+  iox-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - name: Build collector image (the standard image)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: ptp-collector:ci
+      - name: Build node image (linux/amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.iox
+          platforms: linux/amd64
+          load: true
+          tags: ptp-node:ci
+      - name: Node pushes to a collector with a pinned certificate
+        run: |
+          set -e
+          docker network create ptpnet
+          docker run -d --name collector --network ptpnet -e PTP_MODE=collector \
+            -e PTP_ADMIN_PASSWORD=ci-admin-password-1 ptp-collector:ci
+          for i in $(seq 40); do docker exec collector python /app/healthcheck.py && break; sleep 1; done
+          TOKEN=$(docker exec collector python /app/ptp_monitor.py --mode collector \
+                    --data-dir /data --add-node ci-cat9300 | grep -o 'ptpn_[A-Za-z0-9_-]*')
+          FP=$(docker logs collector 2>&1 | grep -o 'fingerprint: [0-9A-F:]*' | head -1 | cut -d' ' -f2)
+          test -n "$TOKEN" && test -n "$FP"
+          docker run -d --name node --network ptpnet --cap-add NET_RAW --cap-add NET_ADMIN \
+            -e PTP_COLLECTOR_URL=https://collector:8443 -e PTP_NODE_TOKEN="$TOKEN" \
+            -e PTP_COLLECTOR_FINGERPRINT="$FP" -e PTP_INTERFACES=eth0 ptp-node:ci
+          for i in $(seq 40); do docker exec node python /app/healthcheck.py && ok=1 && break; sleep 1; done
+          test "${ok:-0}" = 1
+          docker image inspect ptp-node:ci --format '{{.Architecture}} {{.Size}}'
+      - name: Logs
+        if: always()
+        run: docker logs collector || true; docker logs node || true
+      - name: Save image tar for the switch
+        run: |
+          docker save ptp-node:ci -o ptp-node.tar
+          sha256sum ptp-node.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ptp-node-iox
+          path: ptp-node.tar
+          retention-days: 30
