@@ -5,3 +5,6 @@ venv/
 *.pcap
 *.csv
 .DS_Store
+# collector accounts, node tokens and generated key - never commit or bake into an image
+ptp_collector_data/
+*.token

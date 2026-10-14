@@ -1,0 +1,29 @@
+# Remote node: captures PTP on this host's network and pushes it to the collector.
+# It has no web UI and listens on no port; it only connects out to the collector.
+#   1. On the collector's Admin page add a node and copy its token.
+#   2. Fill in the values below, then:  docker compose -f docker-compose.node.yml up -d --build
+# Linux hosts only for real captures (needs host networking, as in standalone mode).
+services:
+  ptp-node:
+    build: .
+    image: ptp-monitor:latest
+    # or use the published image:
+    # image: ghcr.io/jballanger0226/ptp-monitor:latest
+    container_name: ptp-node
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_RAW      # raw packet capture
+      - NET_ADMIN    # promiscuous mode
+    environment:
+      PTP_MODE: node
+      PTP_COLLECTOR_URL: "https://collector.example.com:8443"
+      PTP_NODE_TOKEN: "ptpn_paste-the-token-here"
+      PTP_INTERFACES: "eth1"                       # required: e.g. "eth1" or "eth1,eth2"
+      # Self-signed collector certificate: pin its fingerprint (printed in the collector's
+      # log and shown on its Admin page when a node is added) ...
+      PTP_COLLECTOR_FINGERPRINT: "AA:BB:CC:..."
+      # ... or, with your own CA, mount the CA file and use PTP_COLLECTOR_CA instead.
+      # PTP_PUSH_INTERVAL: "2"
+      # PTP_JOIN_DOMAIN: "0"
+      # PTP_TTL: "1"

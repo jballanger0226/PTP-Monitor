@@ -1,4 +1,7 @@
 # docker compose up -d     then open http://<this host>:8080
+#
+# Many sites at once? See docker-compose.collector.yml and docker-compose.node.yml:
+# one central collector (HTTPS, login) plus a headless node at each site.
 services:
   ptp-monitor:
     build: .
