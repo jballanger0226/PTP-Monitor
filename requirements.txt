@@ -12,3 +12,7 @@ scapy>=2.4.3
 # Optional: extra way to find each interface's IPv4 address.
 # The program works without it; remove this line if you prefer.
 psutil>=5.6
+
+# Optional, collector only: creates its self-signed HTTPS certificate on the first
+# start. Without it the openssl command-line tool is used, or pass --cert/--key.
+cryptography>=3.4

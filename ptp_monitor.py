@@ -29,6 +29,13 @@ delay (end-to-end mechanism), charts the corrections with Max / Min / Average /
 Median / 2-sigma statistics and shows the grandmaster's time in UTC and TAI.
 It measures only - it never adjusts this host's clock.
 
+Distributed use (optional; standalone is the default and works as before)
+-------------------------------------------------------------------------
+  --mode collector   HTTPS web UI with user login that shows many nodes; captures nothing
+  --mode node        captures like standalone but has no web UI: it pushes its
+                     dashboard data to the collector over outbound HTTPS with a token
+  See README.md, "Collector and nodes".
+
 Requirements
 ------------
   Python 3.8+,  pip install -r requirements.txt   (scapy; psutil optional)
@@ -42,17 +49,28 @@ Usage  (see README.md for everything else)
   sudo python3 ptp_monitor.py -i eth1 -i eth2  # start capturing right away
   sudo python3 ptp_monitor.py -i eth1 --join-domain 0 --ttl 16
   sudo python3 ptp_monitor.py --buffer-mb 512  # bigger capture buffer
+  python3 ptp_monitor.py --mode collector      # https://<host>:8443, no root needed
+  sudo python3 ptp_monitor.py --mode node -i eth1 --collector-url https://host:8443 \\
+       --token-file node.token --collector-fingerprint AA:BB:...
 """
 import argparse
+import base64
 import csv
+import gzip
+import hashlib
+import hmac
+import http.client
 import io
 import errno
 import json
 import math
 import os
 import re
+import secrets
 import shutil
+import signal
 import socket
+import ssl
 import datetime
 import struct
 import subprocess
@@ -61,14 +79,18 @@ import threading
 import time
 from collections import Counter, deque
 from decimal import Decimal
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 try:
     from scapy.all import (AsyncSniffer, Dot1Q, Ether, IP, IPv6, UDP, conf,
                            get_if_addr, get_if_hwaddr, get_if_list)
+    HAVE_SCAPY = True
 except ImportError:
-    sys.exit("This program needs scapy:  pip install scapy")
+    # Only the collector (--mode collector) can run without scapy: it captures
+    # nothing, it just receives what the nodes send.  main() checks this.
+    HAVE_SCAPY = False
 
 GROUPS = ["224.0.1.129", "224.0.1.130", "224.0.1.131", "224.0.1.132"]
 # IEEE 1588 Annex D: domains 0-3 have their own group, 4-127 use 224.0.1.129
@@ -1377,6 +1399,41 @@ BUFFER = CaptureBuffer()
 # --------------------------------------------------------------------------
 # Optional PTP participation: slave-only ordinary clock, end-to-end delay
 # --------------------------------------------------------------------------
+def parse_slave_request(body):
+    """Validate a "join a PTP domain" request (from the web page, or from the
+    collector for a remote node).  Returns the slave configuration or raises
+    ValueError with a message for the user."""
+    if not isinstance(body, dict):
+        raise ValueError("Bad request")
+    try:
+        domain = int(body.get("domain", 0))
+        if not 0 <= domain <= 127:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError("Domain must be a number from 0 to 127")
+    iface = str(body.get("iface", ""))
+    dreq = str(body.get("dreq", "auto"))
+    if dreq not in ("auto", "sync"):
+        try:
+            if not -7 <= int(dreq) <= 7:
+                raise ValueError
+        except ValueError:
+            raise ValueError("Bad Delay_Req rate")
+    force = str(body.get("force_master", "") or "").strip()
+    if force and not _valid_ip(force):
+        raise ValueError("'Only follow master IP' is not a valid IPv4 address")
+    try:
+        ttl = int(body.get("ttl", 1))
+        if not 1 <= ttl <= MAX_TTL:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError("TTL must be a whole number from 1 to %d" % MAX_TTL)
+    return dict(domain=domain, iface=iface, dreq=dreq, ttl=ttl,
+                unicast=bool(body.get("unicast")),
+                timescale="tai" if body.get("timescale") == "tai" else "utc",
+                force_master=force)
+
+
 class Slave:
     """Follows the best master in one domain, sends Delay_Req after Sync and
     records offset / path delay.  Timestamps are the capture (pcap) timestamps
@@ -1419,32 +1476,9 @@ class Slave:
     # -- control ------------------------------------------------------------
     def start_from_request(self, body):
         try:
-            domain = int(body.get("domain", 0))
-            if not 0 <= domain <= 127:
-                raise ValueError
-        except (TypeError, ValueError):
-            return dict(ok=False, error="Domain must be a number from 0 to 127")
-        iface = str(body.get("iface", ""))
-        dreq = str(body.get("dreq", "auto"))
-        if dreq not in ("auto", "sync"):
-            try:
-                if not -7 <= int(dreq) <= 7:
-                    raise ValueError
-            except ValueError:
-                return dict(ok=False, error="Bad Delay_Req rate")
-        force = str(body.get("force_master", "") or "").strip()
-        if force and not _valid_ip(force):
-            return dict(ok=False, error="'Only follow master IP' is not a valid IPv4 address")
-        try:
-            ttl = int(body.get("ttl", 1))
-            if not 1 <= ttl <= MAX_TTL:
-                raise ValueError
-        except (TypeError, ValueError):
-            return dict(ok=False, error="TTL must be a whole number from 1 to %d" % MAX_TTL)
-        cfg = dict(domain=domain, iface=iface, dreq=dreq, ttl=ttl,
-                   unicast=bool(body.get("unicast")),
-                   timescale="tai" if body.get("timescale") == "tai" else "utc",
-                   force_master=force)
+            cfg = parse_slave_request(body)
+        except ValueError as e:
+            return dict(ok=False, error=str(e))
         return self.start(cfg)
 
     def start(self, cfg):
@@ -2304,6 +2338,24 @@ class Capture:
 CAP = None
 
 
+def build_state(window=300):
+    """Everything the dashboard shows, as one JSON-able dict.  Served by
+    /api/state in standalone mode and pushed to the collector by a node."""
+    ann = ANNOUNCES.snapshot()
+    s = STATS.snapshot(window, roll=CAP.running, ann_rows=ann["rows"])
+    me = None
+    if SLAVE.running and SLAVE.cfg:
+        me = dict(domain=str(SLAVE.cfg.get("domain")), clock=SLAVE.clock_str,
+                  ip=SLAVE.ip)
+    s["topology"] = STATS.topology(ann["rows"], me)
+    s["mcast"] = MCAST.snapshot(CAP.active, CAP.igmp_in_filter)
+    s.update(running=CAP.running, active=CAP.active, groups=GROUPS,
+             bpf=CAP.bpf, slave=SLAVE.snapshot(),
+             announce=ann, pcap=PCAP.info(), buffer=BUFFER.info(),
+             uptime=(time.time() - CAP.started_at) if CAP.started_at else 0)
+    return s
+
+
 HIDE_REASONS = {"wifi": "Wi-Fi", "cellular": "cellular", "tunnel": "VPN / tunnel"}
 
 
@@ -2362,24 +2414,12 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         q = parse_qs(u.query)
         if u.path == "/":
-            return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+            return self._send(200, PAGE_STANDALONE.encode(), "text/html; charset=utf-8")
         if u.path == "/api/interfaces":
             return self._send(200, list_interfaces(q.get("all", ["0"])[0] == "1"))
         if u.path == "/api/state":
             window = max(30, min(3600, int(q.get("window", ["300"])[0])))
-            ann = ANNOUNCES.snapshot()
-            s = STATS.snapshot(window, roll=CAP.running, ann_rows=ann["rows"])
-            me = None
-            if SLAVE.running and SLAVE.cfg:
-                me = dict(domain=str(SLAVE.cfg.get("domain")), clock=SLAVE.clock_str,
-                          ip=SLAVE.ip)
-            s["topology"] = STATS.topology(ann["rows"], me)
-            s["mcast"] = MCAST.snapshot(CAP.active, CAP.igmp_in_filter)
-            s.update(running=CAP.running, active=CAP.active, groups=GROUPS,
-                     bpf=CAP.bpf, slave=SLAVE.snapshot(),
-                     announce=ann, pcap=PCAP.info(), buffer=BUFFER.info(),
-                     uptime=(time.time() - CAP.started_at) if CAP.started_at else 0)
-            return self._send(200, s)
+            return self._send(200, build_state(window))
         if u.path == "/api/pcap":
             recs, size = PCAP.snapshot()
             self.send_response(200)
@@ -2550,7 +2590,7 @@ mark{background:rgba(186,117,23,.35);color:inherit;border-radius:2px;padding:0 1
 <script>
 try{const t=localStorage.getItem('ptpTheme');if(t==='light'||t==='dark')document.documentElement.dataset.theme=t}catch(e){}
 </script>
-</head><body><main>
+</head><body><main><!--@COLLECTOR_BAR@-->
 <div class="topbar"><h1>PTP Multicast Monitor</h1>
   <div class="seg" role="group" aria-label="Colour theme" id="themeSeg">
     <button data-theme-set="system" title="Follow the system light / dark setting">System</button>
@@ -2747,9 +2787,13 @@ const NOMAC='This clock identity is not in the MAC-based form (xx:xx:xx:ff:fe:xx
 const macSub=c=>{const m=clockMac(c);return m?`<br><small class="mac" title="MAC address derived from the clock identity">MAC ${m}</small>`:`<br><small title="${NOMAC}">MAC &ndash;</small>`};
 let running=false,slRunning=false,sIfaceTouched=false;
 
+const NODE=window.PTP_NODE||'';        // collector only: the node whose data is shown
 async function api(path,body){
+  if(NODE)path+=(path.includes('?')?'&':'?')+'node='+encodeURIComponent(NODE);
   const o=body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)};
-  const r=await fetch(path,o);return r.json();
+  const r=await fetch(path,o);
+  if(r.status===401){location.href='/login';throw new Error('login required')}
+  return r.json();
 }
 const fmtLog=l=>{if(l===null||l===undefined)return '-';const s=Math.pow(2,l);
   return (s>=1?(+s.toPrecision(3))+' s':(+(s*1000).toPrecision(3))+' ms')+' (2^'+l+')'};
@@ -3212,7 +3256,9 @@ function renderDreq(list){
     :`<tr><td colspan="13" class="empty">${list.length?'All Delay_Req senders match their grandmaster\u2019s Sync interval.':'No Delay_Req messages captured yet.'}</td></tr>`;
 }
 $('dqAll').onchange=()=>{if(lastS)renderDreq(lastS.dreq_hosts||[])};
-$('bDqCsv').onclick=()=>{location.href='/api/dreq.csv'+($('dqAll').checked?'?all=1':'')};
+$('bDqCsv').onclick=()=>{
+  const q=[NODE?'node='+encodeURIComponent(NODE):'',$('dqAll').checked?'all=1':''].filter(Boolean).join('&');
+  location.href='/api/dreq.csv'+(q?'?'+q:'')};
 async function loadPackets(){
   const p=await api('/api/packets?limit=200&type='+encodeURIComponent($('fType').value)+'&q='+encodeURIComponent($('fText').value));
   $('pktInfo').textContent='showing '+p.length+' most recent'+(p.length?'':' (none match)');
@@ -3285,9 +3331,1782 @@ document.querySelectorAll('[data-theme-set]').forEach(b=>b.onclick=()=>applyThem
 try{matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>{if(themePref()==='system'&&lastS)render(lastS)})}catch(e){}
 applyTheme(themePref(),false);
 
+/*@COLLECTOR_JS@*/
 loadIfaces().then(tick);setInterval(tick,1000);
 addEventListener('resize',tick);
 </script></body></html>
+"""
+# The same page serves the standalone program and the collector's per-node view;
+# the collector fills in the two markers (see COLLECTOR_BAR / COLLECTOR_JS).
+PAGE_STANDALONE = PAGE.replace("<!--@COLLECTOR_BAR@-->", "").replace("/*@COLLECTOR_JS@*/", "")
+
+
+# ==========================================================================
+# Distributed deployment: remote NODES push to one COLLECTOR
+#
+#   --mode standalone  (default)  capture + web UI in one program, as always
+#   --mode node        capture + analysis only, no web UI; pushes its dashboard
+#                      data to the collector over outbound HTTPS (per-node token)
+#   --mode collector   no capture; HTTPS web UI with local user accounts that
+#                      shows every node's dashboard (the same page as standalone)
+# ==========================================================================
+PROTO = 1                                   # node -> collector protocol version
+NODE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+USER_RE = re.compile(r"^[a-z0-9][a-z0-9._@-]{0,63}$")
+MIN_PASSWORD = 10
+ROLES = ("admin", "viewer")
+MAX_PUSH_BYTES = 8 * 1024 * 1024            # compressed push body
+MAX_STATE_BYTES = 64 * 1024 * 1024          # ... after decompression
+MAX_JSON_BYTES = 64 * 1024                  # any other POST body
+COOKIE = "__Host-ptp_session"
+PUSH_PACKETS = 200                          # recent packets sent with each push
+
+
+def _b64(b):
+    return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+
+def _unb64(s):
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def log(msg, err=False):
+    print("%s  %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg),
+          file=sys.stderr if err else sys.stdout, flush=True)
+
+
+# ---- passwords ------------------------------------------------------------
+def hash_password(pw):
+    salt = os.urandom(16)
+    if hasattr(hashlib, "scrypt"):
+        n, r, p = 2 ** 14, 8, 1
+        dk = hashlib.scrypt(pw.encode(), salt=salt, n=n, r=r, p=p, dklen=32,
+                            maxmem=128 * 1024 * 1024)
+        return "scrypt$%d$%d$%d$%s$%s" % (n, r, p, _b64(salt), _b64(dk))
+    it = 600000
+    dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, it, 32)
+    return "pbkdf2$%d$%s$%s" % (it, _b64(salt), _b64(dk))
+
+
+def verify_password(pw, stored):
+    try:
+        parts = stored.split("$")
+        if parts[0] == "scrypt":
+            n, r, p = int(parts[1]), int(parts[2]), int(parts[3])
+            salt, want = _unb64(parts[4]), _unb64(parts[5])
+            got = hashlib.scrypt(pw.encode(), salt=salt, n=n, r=r, p=p,
+                                 dklen=len(want), maxmem=128 * 1024 * 1024)
+        elif parts[0] == "pbkdf2":
+            salt, want = _unb64(parts[2]), _unb64(parts[3])
+            got = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, int(parts[1]),
+                                      len(want))
+        else:
+            return False
+        return hmac.compare_digest(got, want)
+    except Exception:
+        return False
+
+
+DUMMY_HASH = None        # verified for unknown users so timing does not reveal them
+
+
+def check_password_rules(name, pw):
+    if not isinstance(pw, str) or len(pw) < MIN_PASSWORD:
+        raise ValueError("The password must be at least %d characters long" % MIN_PASSWORD)
+    if len(pw) > 256:
+        raise ValueError("The password is too long")
+    if pw.lower() == (name or "").lower():
+        raise ValueError("The password must not be the user name")
+
+
+# ---- users, nodes, sessions (collector) --------------------------------------
+class CollectorStore:
+    """Accounts and node tokens (JSON files in the data directory, mode 0600),
+    login sessions and login throttling (memory), and the latest data pushed by
+    each node (memory only - like the standalone program, nothing else is kept)."""
+
+    SESSION_PURGE_EVERY = 300
+
+    def __init__(self, data_dir, session_hours=12):
+        self.dir = os.path.abspath(data_dir)
+        os.makedirs(self.dir, mode=0o700, exist_ok=True)
+        self.session_secs = int(session_hours * 3600)
+        self.lock = threading.RLock()
+        self.users, self.nodes = {}, {}
+        self._mtimes = {}
+        self._last_check = 0.0
+        self.sessions = {}                    # token -> dict(user, exp, ip)
+        self._last_purge = time.time()
+        self.fails = {}                       # throttle key -> [timestamps]
+        self.live = {}                        # node -> dict(state, packets, ...)
+        self.cmd_log = {}                     # node -> recent remote commands (memory only)
+        self._load(force=True)
+
+    # -- files ---------------------------------------------------------------
+    def _path(self, what):
+        return os.path.join(self.dir, what + ".json")
+
+    def _load(self, force=False):
+        with self.lock:
+            for what, attr in (("users", "users"), ("nodes", "nodes")):
+                path = self._path(what)
+                try:
+                    mt = os.stat(path).st_mtime_ns
+                except OSError:
+                    mt = None
+                if not force and self._mtimes.get(what) == mt:
+                    continue
+                self._mtimes[what] = mt
+                if mt is None:
+                    setattr(self, attr, {})
+                    continue
+                try:
+                    with open(path) as f:
+                        setattr(self, attr, json.load(f).get(what, {}))
+                except (OSError, ValueError) as e:
+                    log("ERROR: cannot read %s (%s) - keeping the previous data" % (path, e), True)
+
+    def _maybe_reload(self):
+        # picks up changes made by the command-line account tools while running
+        now = time.time()
+        if now - self._last_check >= 1.0:
+            self._last_check = now
+            self._load()
+
+    def _save(self, what):
+        path = self._path(what)
+        tmp = "%s.%d.tmp" % (path, os.getpid())
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({what: getattr(self, what)}, f, indent=1, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        try:
+            self._mtimes[what] = os.stat(path).st_mtime_ns
+        except OSError:
+            pass
+
+    # -- users ---------------------------------------------------------------
+    @staticmethod
+    def norm_user(name):
+        name = (name or "").strip().lower()
+        if not USER_RE.match(name):
+            raise ValueError("User names use a-z, 0-9 and . _ @ - (1-64 characters)")
+        return name
+
+    def has_users(self):
+        with self.lock:
+            self._maybe_reload()
+            return bool(self.users)
+
+    def list_users(self):
+        with self.lock:
+            self._maybe_reload()
+            return [dict(name=n, role=u["role"], created=u.get("created"),
+                         must_change=bool(u.get("must_change")))
+                    for n, u in sorted(self.users.items())]
+
+    def get_user(self, name):
+        with self.lock:
+            self._maybe_reload()
+            return self.users.get(name)
+
+    def add_user(self, name, pw, role="viewer", must_change=False):
+        name = self.norm_user(name)
+        if role not in ROLES:
+            raise ValueError("Role must be one of: " + ", ".join(ROLES))
+        check_password_rules(name, pw)
+        with self.lock:
+            self._maybe_reload()
+            if name in self.users:
+                raise ValueError("User '%s' already exists" % name)
+            self.users[name] = dict(hash=hash_password(pw), role=role,
+                                    created=int(time.time()),
+                                    must_change=bool(must_change))
+            self._save("users")
+        return name
+
+    def set_password(self, name, pw, must_change=False, keep_session=None):
+        check_password_rules(name, pw)
+        with self.lock:
+            self._maybe_reload()
+            u = self.users.get(name)
+            if u is None:
+                raise ValueError("No such user")
+            u["hash"] = hash_password(pw)
+            u["must_change"] = bool(must_change)
+            self._save("users")
+            self.drop_sessions(name, keep=keep_session)
+
+    def set_role(self, name, role):
+        if role not in ROLES:
+            raise ValueError("Role must be one of: " + ", ".join(ROLES))
+        with self.lock:
+            self._maybe_reload()
+            u = self.users.get(name)
+            if u is None:
+                raise ValueError("No such user")
+            if u["role"] == "admin" and role != "admin" and self._admins() <= 1:
+                raise ValueError("There must be at least one admin")
+            u["role"] = role
+            self._save("users")
+
+    def delete_user(self, name):
+        with self.lock:
+            self._maybe_reload()
+            u = self.users.get(name)
+            if u is None:
+                raise ValueError("No such user")
+            if u["role"] == "admin" and self._admins() <= 1:
+                raise ValueError("There must be at least one admin")
+            del self.users[name]
+            self._save("users")
+            self.drop_sessions(name)
+
+    def _admins(self):
+        return sum(1 for u in self.users.values() if u["role"] == "admin")
+
+    def check_login(self, name, pw):
+        """The user record when name/password are right, else None.  A hash is
+        always computed so an unknown user name takes as long as a wrong password."""
+        global DUMMY_HASH
+        if DUMMY_HASH is None:
+            DUMMY_HASH = hash_password("not-a-real-password")
+        with self.lock:
+            self._maybe_reload()
+            u = self.users.get((name or "").strip().lower())
+        ok = verify_password(pw if isinstance(pw, str) else "", u["hash"] if u else DUMMY_HASH)
+        return u if (u and ok) else None
+
+    # -- sessions ------------------------------------------------------------
+    def new_session(self, user, ip):
+        tok = secrets.token_urlsafe(32)
+        with self.lock:
+            self.sessions[tok] = dict(user=user, exp=time.time() + self.session_secs, ip=ip)
+        return tok
+
+    def get_session(self, tok):
+        """dict(user, role, must_change, token) for a live session, else None.
+        Each use extends the session (idle timeout)."""
+        now = time.time()
+        with self.lock:
+            self._maybe_reload()
+            if now - self._last_purge > self.SESSION_PURGE_EVERY:
+                self._last_purge = now
+                for k in [k for k, v in self.sessions.items() if v["exp"] < now]:
+                    del self.sessions[k]
+            s = self.sessions.get(tok)
+            if not s or s["exp"] < now:
+                self.sessions.pop(tok, None)
+                return None
+            u = self.users.get(s["user"])
+            if u is None:
+                del self.sessions[tok]
+                return None
+            s["exp"] = now + self.session_secs
+            return dict(user=s["user"], role=u["role"], token=tok,
+                        must_change=bool(u.get("must_change")))
+
+    def end_session(self, tok):
+        with self.lock:
+            self.sessions.pop(tok, None)
+
+    def drop_sessions(self, user, keep=None):
+        with self.lock:
+            for k in [k for k, v in self.sessions.items()
+                      if v["user"] == user and k != keep]:
+                del self.sessions[k]
+
+    # -- login throttling ----------------------------------------------------
+    FAIL_WINDOW = 600
+    LIMITS = (("ip", 10), ("user", 20))
+
+    def _fail_keys(self, ip, user):
+        return (("ip", ip), ("user", (user or "").strip().lower()))
+
+    def throttled(self, ip, user):
+        now = time.time()
+        with self.lock:
+            for (kind, key), (_, limit) in zip(self._fail_keys(ip, user), self.LIMITS):
+                hist = [t for t in self.fails.get((kind, key), []) if now - t < self.FAIL_WINDOW]
+                self.fails[(kind, key)] = hist
+                if len(hist) >= limit:
+                    return int(self.FAIL_WINDOW - (now - hist[0])) + 1
+        return 0
+
+    def record_fail(self, ip, user):
+        with self.lock:
+            for k in self._fail_keys(ip, user):
+                self.fails.setdefault(k, []).append(time.time())
+            if len(self.fails) > 5000:                       # keep memory bounded
+                cutoff = time.time() - self.FAIL_WINDOW
+                self.fails = {k: v for k, v in self.fails.items() if v and v[-1] > cutoff}
+
+    def clear_fails(self, ip, user):
+        with self.lock:
+            self.fails.pop(("user", (user or "").strip().lower()), None)
+
+    # -- nodes ---------------------------------------------------------------
+    @staticmethod
+    def _tok_hash(tok):
+        return hashlib.sha256(tok.encode()).hexdigest()
+
+    def list_node_records(self):
+        with self.lock:
+            self._maybe_reload()
+            return {n: dict(r) for n, r in self.nodes.items()}
+
+    def has_node(self, name):
+        with self.lock:
+            self._maybe_reload()
+            return name in self.nodes
+
+    def add_node(self, name, by=""):
+        if not NODE_NAME_RE.match(name or ""):
+            raise ValueError("Node names use letters, digits and . _ - (1-64 characters, "
+                             "starting with a letter or digit)")
+        with self.lock:
+            self._maybe_reload()
+            if name in self.nodes:
+                raise ValueError("A node called '%s' already exists" % name)
+            tok = "ptpn_" + secrets.token_urlsafe(32)
+            self.nodes[name] = dict(token_hash=self._tok_hash(tok),
+                                    created=int(time.time()), created_by=by)
+            self._save("nodes")
+        return tok
+
+    def rotate_node(self, name):
+        with self.lock:
+            self._maybe_reload()
+            if name not in self.nodes:
+                raise ValueError("No such node")
+            tok = "ptpn_" + secrets.token_urlsafe(32)
+            self.nodes[name]["token_hash"] = self._tok_hash(tok)
+            self.nodes[name]["rotated"] = int(time.time())
+            self._save("nodes")
+            self.live.pop(name, None)             # the old sender is no longer trusted
+            self.cmd_log.pop(name, None)
+        return tok
+
+    def delete_node(self, name):
+        with self.lock:
+            self._maybe_reload()
+            if name not in self.nodes:
+                raise ValueError("No such node")
+            del self.nodes[name]
+            self._save("nodes")
+            self.live.pop(name, None)
+            self.cmd_log.pop(name, None)
+
+    def node_for_token(self, tok):
+        if not tok or len(tok) > 200:
+            return None
+        h = self._tok_hash(tok)
+        found = None
+        with self.lock:
+            self._maybe_reload()
+            for name, rec in self.nodes.items():          # no early exit: constant work
+                if hmac.compare_digest(rec["token_hash"], h):
+                    found = name
+        return found
+
+    # -- remote commands: queued here, delivered in the answer to the node's next push --
+    CMD_LOG_LEN = 20
+    CMD_PICKUP_SECS = 60           # a node that does not pick a command up in this time
+    CMD_CONFIRM_SECS = 30          # ... or does not report its outcome in this time
+
+    def queue_command(self, name, ctype, params, by):
+        with self.lock:
+            log_ = self.cmd_log.setdefault(name, [])
+            if ctype.startswith("slave_"):          # the newest join/leave wins
+                for c in log_:
+                    if c["status"] == "queued" and c["type"].startswith("slave_"):
+                        c["status"], c["error"] = "superseded", "replaced by a newer command"
+            rec = dict(id=secrets.token_hex(6), type=ctype, params=params, by=by,
+                       ts=time.time(), status="queued", error="")
+            log_.append(rec)
+            del log_[:-self.CMD_LOG_LEN]
+            return rec["id"]
+
+    def take_commands(self, name, limit=5):
+        """The queued commands for a node, now handed over (marked 'sent')."""
+        now = time.time()
+        out = []
+        with self.lock:
+            for c in self.cmd_log.get(name, []):
+                if c["status"] == "queued" and len(out) < limit:
+                    c["status"], c["sent"] = "sent", now
+                    out.append(dict(id=c["id"], type=c["type"], params=c["params"]))
+        return out
+
+    def report_results(self, name, results):
+        with self.lock:
+            by_id = {c["id"]: c for c in self.cmd_log.get(name, [])}
+            for r in results:
+                c = by_id.get(r.get("id"))
+                if c is not None and c["status"] == "sent":
+                    c["status"] = "ok" if r.get("ok") else "failed"
+                    c["error"] = str(r.get("error", ""))[:300]
+
+    def commands_view(self, name, n=5):
+        now = time.time()
+        with self.lock:
+            log_ = self.cmd_log.get(name, [])
+            for c in log_:
+                if c["status"] == "queued" and now - c["ts"] > self.CMD_PICKUP_SECS:
+                    c["status"], c["error"] = "timeout", "the node did not pick the command up"
+                elif c["status"] == "sent" and now - c["sent"] > self.CMD_CONFIRM_SECS:
+                    c["status"], c["error"] = "timeout", "the node did not confirm the command"
+            return [dict(id=c["id"], type=c["type"], by=c["by"], ts=c["ts"],
+                         status=c["status"], error=c["error"],
+                         label=command_label(c["type"], c["params"]))
+                    for c in log_[-n:]]
+
+    def update_live(self, name, state, packets, info, remote):
+        now = time.time()
+        with self.lock:
+            if name not in self.nodes:
+                return
+            prev = self.live.get(name)
+            self.live[name] = dict(state=state, packets=packets, info=info,
+                                   remote=remote, received=now,
+                                   first=prev["first"] if prev else now,
+                                   pushes=(prev["pushes"] if prev else 0) + 1)
+
+    def get_live(self, name):
+        with self.lock:
+            return self.live.get(name)
+
+
+STORE = None
+CFG = {}                    # collector settings (fingerprint, ...)
+
+
+def command_label(ctype, params):
+    if ctype == "slave_start":
+        return "Join domain %s on %s" % (params.get("domain"), params.get("iface"))
+    if ctype == "slave_stop":
+        return "Leave the domain"
+    return ctype
+
+
+def is_online(live):
+    if not live:
+        return False
+    try:
+        interval = float((live.get("info") or {}).get("interval") or 2)
+    except (TypeError, ValueError):
+        interval = 2.0
+    interval = min(max(interval, 1.0), 60.0)             # a node cannot pin itself "online"
+    return time.time() - live["received"] <= max(3 * interval, 10)
+
+
+def node_summary(name, rec, live):
+    """One row of the collector's node overview."""
+    now = time.time()
+    row = dict(name=name, created=rec.get("created"), seen=bool(live),
+               online=is_online(live), age=None, remote=None, host=None,
+               platform=None, running=None, active=[], total=0, rate=0.0,
+               bps=0.0, hosts=0, gms=[], pushes=0)
+    if live:
+        st, info = live["state"], live.get("info") or {}
+        row.update(age=now - live["received"], remote=live.get("remote"),
+                   host=info.get("hostname"), platform=info.get("platform"),
+                   running=bool(st.get("running")), active=st.get("active", []),
+                   total=st.get("total", 0), rate=st.get("rate", 0.0),
+                   bps=st.get("bps", 0.0), hosts=len(st.get("sync_hosts", [])),
+                   pushes=live["pushes"], proto=info.get("proto"))
+        for r in (st.get("announce") or {}).get("rows", []):
+            if r.get("role") == "master":
+                row["gms"].append(dict(domain=r.get("domain"), src=r.get("src"),
+                                       clock=r.get("clock")))
+    return row
+
+
+# ---- TLS certificate for the collector ---------------------------------------
+def _cert_fingerprint(cert_path):
+    with open(cert_path) as f:
+        m = re.search(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+                      f.read(), re.S)
+    if not m:
+        raise ValueError("no certificate found in %s" % cert_path)
+    der = ssl.PEM_cert_to_DER_cert(m.group(0))
+    h = hashlib.sha256(der).hexdigest().upper()
+    return ":".join(h[i:i + 2] for i in range(0, len(h), 2))
+
+
+def _default_sans(bind_host, extra):
+    names = ["localhost", "127.0.0.1", "::1"]
+    try:
+        names.append(socket.gethostname())
+        names.append(socket.getfqdn())
+    except Exception:
+        pass
+    try:                                    # the address used for the default route
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("192.0.2.1", 9))         # nothing is sent
+        names.append(s.getsockname()[0])
+        s.close()
+    except Exception:
+        pass
+    if bind_host and bind_host not in ("", "0.0.0.0", "::"):
+        names.append(bind_host)
+    names += list(extra or [])
+    out = []
+    for n in names:
+        if n and n not in out:
+            out.append(n)
+    return out
+
+
+def _is_ip(s):
+    try:
+        socket.inet_pton(socket.AF_INET, s)
+        return True
+    except OSError:
+        pass
+    try:
+        socket.inet_pton(socket.AF_INET6, s)
+        return True
+    except OSError:
+        return False
+
+
+def generate_self_signed(cert_path, key_path, sans, days=825):
+    """Self-signed ECDSA P-256 certificate.  Uses the 'cryptography' package when
+    it is installed, otherwise the openssl command-line tool."""
+    cn = sans[0] if sans else "ptp-monitor"
+    try:
+        import ipaddress
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+    except ImportError:
+        x509 = None
+    if x509 is not None:
+        key = ec.generate_private_key(ec.SECP256R1())
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn[:64]),
+                          x509.NameAttribute(NameOID.ORGANIZATION_NAME, "PTP Monitor collector")])
+        alt = [x509.IPAddress(ipaddress.ip_address(n)) if _is_ip(n) else x509.DNSName(n)
+               for n in sans]
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cert = (x509.CertificateBuilder()
+                .subject_name(name).issuer_name(name)
+                .public_key(key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(now - datetime.timedelta(days=1))
+                .not_valid_after(now + datetime.timedelta(days=days))
+                .add_extension(x509.SubjectAlternativeName(alt), critical=False)
+                .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+                .add_extension(x509.KeyUsage(
+                    digital_signature=True, content_commitment=False, key_encipherment=False,
+                    data_encipherment=False, key_agreement=False, key_cert_sign=False,
+                    crl_sign=False, encipher_only=False, decipher_only=False), critical=True)
+                .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]),
+                               critical=False)
+                .sign(key, hashes.SHA256()))
+        fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(key.private_bytes(serialization.Encoding.PEM,
+                                      serialization.PrivateFormat.PKCS8,
+                                      serialization.NoEncryption()))
+        with open(cert_path, "wb") as f:
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
+        return
+    exe = shutil.which("openssl")
+    if not exe:
+        raise RuntimeError(
+            "Cannot create a self-signed certificate: install the 'cryptography' package "
+            "(pip install cryptography) or the openssl tool, or pass your own --cert and --key.")
+    alt = ",".join(("IP:" if _is_ip(n) else "DNS:") + n for n in sans)
+    fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.close(fd)
+    cmd = [exe, "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+           "-nodes", "-keyout", key_path, "-out", cert_path, "-days", str(days),
+           "-subj", "/CN=%s/O=PTP Monitor collector" % cn[:64], "-addext", "subjectAltName=" + alt,
+           "-addext", "basicConstraints=critical,CA:FALSE",
+           "-addext", "extendedKeyUsage=serverAuth"]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError("openssl could not create the certificate: "
+                           + r.stderr.decode(errors="replace").strip())
+    os.chmod(key_path, 0o600)
+
+
+def prepare_tls(data_dir, cert, key, bind_host, extra_sans):
+    """(ssl context, cert path, self_signed) - the user's cert/key if given, else
+    the one generated on the first run in the data directory."""
+    self_signed = False
+    if cert or key:
+        if not (cert and key):
+            raise RuntimeError("--cert and --key must be given together")
+    else:
+        cert = os.path.join(data_dir, "collector.crt")
+        key = os.path.join(data_dir, "collector.key")
+        self_signed = True
+        if not (os.path.exists(cert) and os.path.exists(key)):
+            sans = _default_sans(bind_host, extra_sans)
+            generate_self_signed(cert, key, sans)
+            log("Created a self-signed certificate %s (valid for: %s)" % (cert, ", ".join(sans)))
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    try:
+        ctx.load_cert_chain(cert, key)
+    except (ssl.SSLError, OSError) as e:
+        raise RuntimeError("cannot load the certificate/key (%s, %s): %s" % (cert, key, e))
+    return ctx, cert, self_signed
+
+
+class TLSServer(ThreadingHTTPServer):
+    """HTTPS server.  The TLS handshake runs in the connection's own thread, so a
+    client that connects and then stalls cannot block new connections."""
+    daemon_threads = True
+    request_queue_size = 64
+    tls_context = None
+
+    def finish_request(self, request, client_address):
+        try:
+            request.settimeout(15)
+            conn = self.tls_context.wrap_socket(request, server_side=True)
+        except (ssl.SSLError, OSError):
+            return
+        try:
+            self.RequestHandlerClass(conn, client_address, self)
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
+# ---- the collector's HTTP handler -------------------------------------------
+class CollectorHandler(BaseHTTPRequestHandler):
+    """Deliberately separate from the standalone Handler: none of the capture
+    controls (/api/start, /api/slave/start, ...) exist on the collector."""
+    protocol_version = "HTTP/1.1"
+    timeout = 60
+    server_version = "PTPMonitorCollector"
+    sys_version = ""
+
+    SEC_HEADERS = (
+        ("Cache-Control", "no-store"),
+        ("X-Content-Type-Options", "nosniff"),
+        ("X-Frame-Options", "DENY"),
+        ("Referrer-Policy", "no-referrer"),
+        ("Strict-Transport-Security", "max-age=31536000"),
+    )
+    # Scripts run only when they carry this response's random nonce, so markup that
+    # a node smuggles into its data (and the page then inserts) can never execute.
+    CSP = ("default-src 'self'; script-src 'nonce-%s'; style-src 'self' 'unsafe-inline'; "
+           "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; "
+           "base-uri 'none'; form-action 'self'")
+
+    def log_message(self, *a):
+        pass
+
+    # -- responses -----------------------------------------------------------
+    def _send(self, code, body, ctype="application/json", headers=(), nonce=None):
+        data = body if isinstance(body, bytes) else json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        for k, v in self.SEC_HEADERS:
+            self.send_header(k, v)
+        self.send_header("Content-Security-Policy", self.CSP % (nonce or "none"))
+        for k, v in headers:
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, code, obj, headers=()):
+        self._send(code, obj, "application/json", headers)
+
+    def _html(self, page, code=200):
+        nonce = secrets.token_urlsafe(16)
+        page = page.replace("<script>", '<script nonce="%s">' % nonce)
+        self._send(code, page.encode(), "text/html; charset=utf-8", nonce=nonce)
+
+    def _redirect(self, to):
+        self._send(302, b"", "text/plain", (("Location", to),))
+
+    def _drain(self):
+        """Read an unread request body before closing: closing a socket that still
+        holds unread data resets the connection and the client never sees our answer."""
+        if self._consumed:
+            return
+        self._consumed = True
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+            if 0 < n <= 2 * 1024 * 1024:
+                self.rfile.read(n)
+        except Exception:
+            pass
+
+    def _fail(self, code, msg, close=False, headers=()):
+        if close:
+            self.close_connection = True
+            self._drain()
+        self._json(code, {"error": msg}, tuple(headers) + ((("Connection", "close"),) if close else ()))
+
+    # -- request helpers -----------------------------------------------------
+    def _ip(self):
+        return self.client_address[0]
+
+    def _session(self):
+        raw = self.headers.get("Cookie")
+        if not raw:
+            return None
+        try:
+            c = SimpleCookie()
+            c.load(raw)
+        except Exception:
+            return None
+        m = c.get(COOKIE)
+        return STORE.get_session(m.value) if m else None
+
+    def _body(self, limit):
+        """Raw request body, or None after an error response has been sent."""
+        try:
+            n = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            self._fail(411, "Content-Length required", close=True)
+            return None
+        if n < 0 or n > limit:
+            self._fail(413, "request too large", close=True)
+            return None
+        self._consumed = True
+        return self.rfile.read(n)
+
+    def _json_body(self):
+        if not self.headers.get("Content-Type", "").startswith("application/json"):
+            self._fail(415, "JSON required", close=True)
+            return None
+        raw = self._body(MAX_JSON_BYTES)
+        if raw is None:
+            return None
+        try:
+            d = json.loads(raw or b"{}")
+            if not isinstance(d, dict):
+                raise ValueError
+            return d
+        except ValueError:
+            self._fail(400, "bad json")
+            return None
+
+    def _same_origin(self):
+        origin = self.headers.get("Origin")
+        if not origin or origin == "null":
+            return origin is None
+        return urlparse(origin).netloc == self.headers.get("Host", "")
+
+    @staticmethod
+    def _qs(q, key, default=""):
+        return q.get(key, [default])[0]
+
+    # -- GET -----------------------------------------------------------------
+    def do_GET(self):
+        self._consumed = True
+        u = urlparse(self.path)
+        path, q = u.path, parse_qs(u.query)
+        if path == "/healthz":
+            return self._send(200, b"ok\n", "text/plain")
+        if path == "/favicon.ico":
+            return self._send(204, b"", "image/x-icon")
+        if path == "/login":
+            if self._session():
+                return self._redirect("/")
+            return self._html(LOGIN_PAGE)
+        s = self._session()
+        if not s:
+            if path.startswith("/api/"):
+                return self._fail(401, "login required")
+            return self._redirect("/login")
+        if s["must_change"] and path not in ("/account", "/api/me"):
+            if path.startswith("/api/"):
+                return self._fail(403, "You must change your password first")
+            return self._redirect("/account")
+        if path == "/":
+            return self._html(shell_page("Nodes", FLEET_BODY, FLEET_JS, s))
+        if path == "/account":
+            return self._html(shell_page("Account", ACCOUNT_BODY, ACCOUNT_JS, s))
+        if path == "/admin":
+            if s["role"] != "admin":
+                return self._html(shell_page("Not allowed", NOTICE % "Only admins can open this page.", "", s), 403)
+            return self._html(shell_page("Admin", ADMIN_BODY, ADMIN_JS, s))
+        if path.startswith("/node/"):
+            return self._node_page(path[6:].strip("/"), s)
+        if path == "/api/me":
+            return self._json(200, dict(user=s["user"], role=s["role"],
+                                        must_change=s["must_change"]))
+        if path == "/api/nodes":
+            recs = STORE.list_node_records()
+            return self._json(200, [node_summary(n, r, STORE.get_live(n))
+                                    for n, r in sorted(recs.items(), key=lambda x: x[0].lower())])
+        if path in ("/api/state", "/api/packets", "/api/dreq.csv"):
+            return self._node_data(path, q)
+        if path == "/api/interfaces":
+            return self._json(200, [])           # interfaces are chosen on each node
+        if path.startswith("/api/admin/"):
+            if s["role"] != "admin":
+                return self._fail(403, "admins only")
+            if path == "/api/admin/users":
+                return self._json(200, STORE.list_users())
+            if path == "/api/admin/info":
+                return self._json(200, dict(fingerprint=CFG.get("fingerprint"),
+                                            self_signed=CFG.get("self_signed", False)))
+        self._fail(404, "not found")
+
+    def _node_page(self, name, s):
+        if not NODE_NAME_RE.match(name) or not STORE.has_node(name):
+            return self._html(shell_page("Not found", NOTICE % "There is no such node.", "", s), 404)
+        if not STORE.get_live(name):
+            body = NOTICE % ("<b>%s</b> has not sent any data yet. This page refreshes by itself. "
+                             "Check the node's command line (token, collector URL, "
+                             "<code>-i</code> interface)." % html_escape(name))
+            return self._html(shell_page(name, body, "setTimeout(()=>location.reload(),5000)", s))
+        bar = (COLLECTOR_BAR.replace("@@NODE@@", js_value(name))
+               .replace("@@USER@@", js_value(dict(name=s["user"], role=s["role"]))))
+        page = (PAGE.replace("<!--@COLLECTOR_BAR@-->", bar)
+                .replace("/*@COLLECTOR_JS@*/", COLLECTOR_JS)
+                .replace("<title>PTP Monitor</title>",
+                         "<title>PTP Monitor – %s</title>" % html_escape(name)))
+        self._html(page)
+
+    def _node_data(self, path, q):
+        name = self._qs(q, "node")
+        live = STORE.get_live(name) if NODE_NAME_RE.match(name) else None
+        if not live:
+            return self._fail(404, "no data from that node yet")
+        st = live["state"]
+        if path == "/api/state":
+            out = dict(st)
+            out["collector"] = dict(node=name, online=is_online(live),
+                                    age=time.time() - live["received"],
+                                    remote=live.get("remote"),
+                                    info=live.get("info") or {}, pushes=live["pushes"],
+                                    commands=STORE.commands_view(name))
+            return self._json(200, out)
+        if path == "/api/packets":
+            try:
+                limit = max(1, min(1000, int(self._qs(q, "limit", "200"))))
+            except ValueError:
+                limit = 200
+            ptype, text = self._qs(q, "type"), self._qs(q, "q").lower()
+            out = []
+            for r in live["packets"]:                      # newest first, as pushed
+                if ptype and r.get("type") != ptype:
+                    continue
+                if text and text not in ("%s %s %s %s %s" % (
+                        r.get("src"), r.get("dst"), r.get("clock"),
+                        r.get("iface"), r.get("type"))).lower():
+                    continue
+                out.append(r)
+                if len(out) >= limit:
+                    break
+            return self._json(200, out)
+        rows = st.get("dreq_hosts", [])
+        if self._qs(q, "all") != "1":
+            rows = [r for r in rows if r.get("status") == "mismatch"]
+        data = dreq_csv(rows).encode("utf-8-sig")
+        self._send(200, data, "text/csv; charset=utf-8", (
+            ("Content-Disposition", 'attachment; filename="ptp_delay_req_check_%s_%s.csv"'
+             % (name, time.strftime("%Y%m%d_%H%M%S"))),))
+
+    # -- POST ----------------------------------------------------------------
+    def do_POST(self):
+        self._consumed = False
+        u = urlparse(self.path)
+        path, q = u.path, parse_qs(u.query)
+        if path == "/api/node/push":
+            return self._node_push()
+        if not self._same_origin():
+            return self._fail(403, "cross-origin request refused", close=True)
+        if path == "/api/login":
+            return self._login()
+        s = self._session()
+        if not s:
+            return self._fail(401, "login required", close=True)
+        body = self._json_body()
+        if body is None:
+            return
+        if path == "/api/logout":
+            STORE.end_session(s["token"])
+            return self._json(200, dict(ok=True), (("Set-Cookie", self._cookie("", 0)),))
+        if path == "/api/account/password":
+            return self._change_own_password(s, body)
+        if s["must_change"]:
+            return self._fail(403, "You must change your password first")
+        if path in ("/api/slave/start", "/api/slave/stop"):
+            return self._slave_command(path, q, body, s)
+        if not path.startswith("/api/admin/"):
+            return self._fail(404, "not found")
+        if s["role"] != "admin":
+            return self._fail(403, "admins only")
+        try:
+            self._admin(path[len("/api/admin/"):].strip("/").split("/"), body, s)
+        except ValueError as e:
+            self._json(400, dict(ok=False, error=str(e)))
+
+    def _slave_command(self, path, q, body, s):
+        """Tell a node to join / leave a PTP domain.  The command waits here until
+        the node's next push, which is when the node can be reached."""
+        if s["role"] != "admin":
+            return self._fail(403, "Only admins can control a node")
+        name = self._qs(q, "node")
+        live = STORE.get_live(name) if NODE_NAME_RE.match(name) else None
+        if not live:
+            return self._json(404, dict(ok=False, error="No data from that node yet"))
+        if not is_online(live):
+            return self._json(409, dict(ok=False, error="The node is offline, so it cannot "
+                                                        "be told to do anything"))
+        if not (live.get("info") or {}).get("control"):
+            return self._json(409, dict(ok=False, error="Remote control is switched off on "
+                                        "this node (it runs with --no-remote-control)"))
+        if path.endswith("/start"):
+            try:
+                cfg = parse_slave_request(body)
+            except ValueError as e:
+                return self._json(400, dict(ok=False, error=str(e)))
+            active = live["state"].get("active") or []
+            if cfg["iface"] not in active:
+                return self._json(400, dict(ok=False, error="%s is not capturing on this node "
+                                  "(capturing on: %s)" % (cfg["iface"] or "That interface",
+                                                          ", ".join(active) or "nothing")))
+            cid = STORE.queue_command(name, "slave_start", cfg, s["user"])
+            log("%s told node %s to join domain %d on %s" % (s["user"], name, cfg["domain"], cfg["iface"]))
+        else:
+            cid = STORE.queue_command(name, "slave_stop", {}, s["user"])
+            log("%s told node %s to leave its domain" % (s["user"], name))
+        self._json(200, dict(ok=True, queued=True, id=cid))
+
+    def _cookie(self, value, max_age):
+        return "%s=%s; Path=/; Max-Age=%d; HttpOnly; Secure; SameSite=Strict" % (COOKIE, value, max_age)
+
+    def _login(self):
+        body = self._json_body()
+        if body is None:
+            return
+        name, pw = body.get("username", ""), body.get("password", "")
+        if not isinstance(name, str) or not isinstance(pw, str):
+            return self._fail(400, "bad request")
+        wait = STORE.throttled(self._ip(), name)
+        if wait:
+            return self._json(429, dict(ok=False, error="Too many failed logins - try again in %d s" % wait),
+                              (("Retry-After", str(wait)),))
+        u = STORE.check_login(name, pw)
+        if not u:
+            STORE.record_fail(self._ip(), name)
+            log("Failed login for %r from %s" % (name[:64], self._ip()), True)
+            return self._json(401, dict(ok=False, error="Wrong user name or password"))
+        uname = name.strip().lower()
+        STORE.clear_fails(self._ip(), uname)
+        tok = STORE.new_session(uname, self._ip())
+        log("Login: %s from %s" % (uname, self._ip()))
+        self._json(200, dict(ok=True, must_change=bool(u.get("must_change"))),
+                   (("Set-Cookie", self._cookie(tok, STORE.session_secs)),))
+
+    def _change_own_password(self, s, body):
+        cur, new = body.get("current", ""), body.get("new", "")
+        if not isinstance(cur, str) or not isinstance(new, str):
+            return self._fail(400, "bad request")
+        wait = STORE.throttled(self._ip(), s["user"])
+        if wait:
+            return self._json(429, dict(ok=False, error="Too many failed attempts - try again in %d s" % wait))
+        if not STORE.check_login(s["user"], cur):
+            STORE.record_fail(self._ip(), s["user"])
+            return self._json(400, dict(ok=False, error="The current password is wrong"))
+        if new == cur:
+            return self._json(400, dict(ok=False, error="Choose a different password"))
+        try:
+            STORE.set_password(s["user"], new, must_change=False, keep_session=s["token"])
+        except ValueError as e:
+            return self._json(400, dict(ok=False, error=str(e)))
+        log("Password changed: %s" % s["user"])
+        self._json(200, dict(ok=True))
+
+    def _admin(self, parts, body, s):
+        what = parts[0]
+        by = s["user"]
+        if what == "users":
+            if len(parts) == 1:                                  # create
+                name = STORE.add_user(body.get("username"), body.get("password"),
+                                      body.get("role", "viewer"), must_change=True)
+                log("User created: %s (%s) by %s" % (name, body.get("role", "viewer"), by))
+                return self._json(200, dict(ok=True, username=name))
+            name, action = parts[1].lower(), (parts[2] if len(parts) > 2 else "")
+            if action == "password":
+                STORE.set_password(name, body.get("password"), must_change=name != by)
+                log("Password reset: %s by %s" % (name, by))
+                return self._json(200, dict(ok=True))
+            if action == "role":
+                STORE.set_role(name, body.get("role"))
+                return self._json(200, dict(ok=True))
+            if action == "delete":
+                if name == by:
+                    raise ValueError("You cannot delete your own account")
+                STORE.delete_user(name)
+                log("User deleted: %s by %s" % (name, by))
+                return self._json(200, dict(ok=True))
+        elif what == "nodes":
+            if len(parts) == 1:                                  # create
+                name = str(body.get("name", "")).strip()
+                tok = STORE.add_node(name, by)
+                log("Node added: %s by %s" % (name, by))
+                return self._json(200, dict(ok=True, name=name, token=tok))
+            name, action = parts[1], (parts[2] if len(parts) > 2 else "")
+            if action == "rotate":
+                tok = STORE.rotate_node(name)
+                log("Node token replaced: %s by %s" % (name, by))
+                return self._json(200, dict(ok=True, name=name, token=tok))
+            if action == "delete":
+                STORE.delete_node(name)
+                log("Node removed: %s by %s" % (name, by))
+                return self._json(200, dict(ok=True))
+        self._fail(404, "not found")
+
+    def _node_push(self):
+        auth = self.headers.get("Authorization", "")
+        name = STORE.node_for_token(auth[7:].strip()) if auth.lower().startswith("bearer ") else None
+        if not name:
+            return self._fail(401, "unknown or revoked node token", close=True)
+        raw = self._body(MAX_PUSH_BYTES)
+        if raw is None:
+            return
+        try:
+            if self.headers.get("Content-Encoding", "").lower() == "gzip":
+                import zlib
+                d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                raw = d.decompress(raw, MAX_STATE_BYTES + 1)
+                if len(raw) > MAX_STATE_BYTES or d.unconsumed_tail:
+                    return self._fail(413, "decompressed push too large", close=True)
+            data = json.loads(raw)
+            st = data["state"]
+            if not (isinstance(st, dict) and isinstance(st.get("types"), list)
+                    and isinstance(st.get("series"), dict) and "total" in st):
+                raise ValueError("not a PTP Monitor state")
+            packets = data.get("packets", [])
+            if not isinstance(packets, list):
+                raise ValueError("packets must be a list")
+            packets = [p for p in packets[:1000] if isinstance(p, dict)]
+            info = data.get("info", {})
+            if not isinstance(info, dict):
+                info = {}
+            if info.get("proto", PROTO) != PROTO:
+                return self._fail(400, "protocol version %s is not supported (this collector "
+                                       "speaks %d)" % (info.get("proto"), PROTO))
+        except Exception as e:
+            return self._fail(400, "bad push: %s" % e)
+        results = data.get("results", [])
+        if isinstance(results, list):
+            STORE.report_results(name, [r for r in results[:20] if isinstance(r, dict)
+                                        and isinstance(r.get("id"), str)])
+        STORE.update_live(name, st, packets, info, self._ip())
+        self._json(200, dict(ok=True, server_time=time.time(),
+                             commands=STORE.take_commands(name)))
+
+
+def html_escape(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;").replace("'", "&#39;"))
+
+
+def js_value(v):
+    """JSON for embedding inside a <script> block."""
+    return json.dumps(v).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+
+
+def shell_page(title, body, script, session):
+    nav_admin = "" if session["role"] != "admin" else '<a href="/admin">Admin</a>'
+    return (SHELL.replace("@@TITLE@@", html_escape(title))
+            .replace("@@BODY@@", body)
+            .replace("@@NAV_ADMIN@@", nav_admin)
+            .replace("@@USER@@", html_escape(session["user"]))
+            .replace("@@ROLE@@", js_value(session["role"]))
+            .replace("@@SCRIPT@@", script))
+
+
+# ---- the node: push this instance's dashboard data to the collector ------------
+class NodePusher(threading.Thread):
+    def __init__(self, url, token, interval=2.0, ca=None, fingerprint=None,
+                 insecure=False, status_file=None, allow_control=True):
+        super().__init__(daemon=True, name="node-push")
+        self.status_file = status_file      # touched after every accepted push
+        self.allow_control = allow_control  # may the collector have us join a domain?
+        self.results = []                   # outcomes of remote commands, sent with the next push
+        self.fast = False                   # push again at once (after running a command)
+        u = urlparse(url if "://" in url else "https://" + url)
+        if u.scheme != "https" or not u.hostname:
+            raise ValueError("--collector-url must be an https:// URL")
+        self.host, self.port = u.hostname, u.port or 443
+        self.prefix = u.path.rstrip("/")
+        self.token, self.interval = token, max(1.0, float(interval))
+        self.fingerprint = None
+        if fingerprint:
+            fp = re.sub(r"[^0-9A-Fa-f]", "", fingerprint).upper()
+            if len(fp) != 64:
+                raise ValueError("--collector-fingerprint must be a SHA-256 fingerprint "
+                                 "(64 hex digits)")
+            self.fingerprint = fp
+        if self.fingerprint or insecure:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE        # replaced by the fingerprint check
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            if insecure and not self.fingerprint:
+                log("WARNING: --insecure-skip-verify: the collector's identity is NOT "
+                    "checked. Prefer --collector-fingerprint or --collector-ca.", True)
+        else:
+            ctx = ssl.create_default_context(cafile=ca)
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        self.ctx = ctx
+        self.conn = None
+        self.stop_evt = threading.Event()
+        self.ok = None                 # None = no attempt yet
+        self.last_err = None
+        self.started = time.time()
+
+    def _connect(self):
+        c = http.client.HTTPSConnection(self.host, self.port, context=self.ctx, timeout=20)
+        c.connect()
+        if self.fingerprint:
+            got = hashlib.sha256(c.sock.getpeercert(binary_form=True)).hexdigest().upper()
+            if not hmac.compare_digest(got, self.fingerprint):
+                c.close()
+                raise ssl.SSLError("collector certificate fingerprint %s does not match "
+                                   "--collector-fingerprint" % got)
+        return c
+
+    def _payload(self):
+        info = dict(proto=PROTO, hostname=socket.gethostname(), platform=sys.platform,
+                    python=sys.version.split()[0], interval=self.interval,
+                    started=self.started, control=self.allow_control)
+        return dict(info=info, state=build_state(300),
+                    packets=STATS.query_packets(PUSH_PACKETS, "", ""),
+                    results=list(self.results))
+
+    def _run_command(self, cmd):
+        """Carry out one command from the collector.  Only these two exist, both
+        validated again here: the node never takes the collector's word for it."""
+        cid = str(cmd.get("id", ""))[:32]
+        ctype, params = cmd.get("type"), cmd.get("params")
+        if not self.allow_control:
+            return dict(id=cid, ok=False, error="Remote control is switched off on this node")
+        try:
+            if ctype == "slave_start":
+                r = SLAVE.start_from_request(params if isinstance(params, dict) else {})
+                what = "join domain %s on %s" % ((params or {}).get("domain"), (params or {}).get("iface"))
+            elif ctype == "slave_stop":
+                SLAVE.stop()
+                r, what = dict(ok=True), "leave the domain"
+            else:
+                return dict(id=cid, ok=False, error="Unknown command")
+        except Exception as e:
+            return dict(id=cid, ok=False, error="%s: %s" % (type(e).__name__, e))
+        log("Command from the collector: %s -> %s" % (what, "done" if r.get("ok") else r.get("error")))
+        return dict(id=cid, ok=bool(r.get("ok")), error=r.get("error", ""))
+
+    def push_once(self):
+        payload = self._payload()
+        sent = len(payload["results"])
+        body = gzip.compress(json.dumps(payload).encode(), 5)
+        hdr = {"Authorization": "Bearer " + self.token, "Content-Type": "application/json",
+               "Content-Encoding": "gzip", "User-Agent": "ptp-monitor-node/%d" % PROTO}
+        for attempt in (1, 2):                 # a kept-alive connection may have gone stale
+            if self.conn is None:
+                self.conn = self._connect()
+            try:
+                self.conn.request("POST", self.prefix + "/api/node/push", body, hdr)
+                r = self.conn.getresponse()
+                data = r.read()
+                break
+            except (http.client.HTTPException, ConnectionError, socket.timeout, OSError):
+                try:
+                    self.conn.close()
+                except Exception:
+                    pass
+                self.conn = None
+                if attempt == 2:
+                    raise
+        if r.status in (401, 403):
+            raise PermissionError("the collector refused this node's token (HTTP %d)" % r.status)
+        if r.status != 200:
+            try:
+                msg = json.loads(data).get("error", "")
+            except Exception:
+                msg = ""
+            raise RuntimeError("collector answered HTTP %d %s" % (r.status, msg))
+        del self.results[:sent]                      # the collector has these outcomes now
+        try:
+            cmds = json.loads(data).get("commands") or []
+        except Exception:
+            cmds = []
+        for cmd in [c for c in cmds if isinstance(c, dict)][:10]:
+            self.results.append(self._run_command(cmd))
+            self.fast = True
+
+    def run(self):
+        wait_extra = 0.0
+        while not self.stop_evt.is_set():
+            t0 = time.time()
+            try:
+                self.push_once()
+                if self.ok is not True:
+                    log("Connected to the collector at %s:%d - sending every %g s"
+                        % (self.host, self.port, self.interval))
+                self.ok, self.last_err, wait_extra = True, None, 0.0
+                if self.status_file:
+                    try:
+                        with open(self.status_file, "w") as f:
+                            f.write("%d\n" % time.time())
+                    except OSError:
+                        pass
+            except Exception as e:
+                try:
+                    if self.conn:
+                        self.conn.close()
+                except Exception:
+                    pass
+                self.conn = None
+                msg = "%s: %s" % (type(e).__name__, e)
+                if self.ok is not False or msg != self.last_err:
+                    log("Cannot send to the collector (%s) - retrying" % msg, True)
+                self.ok, self.last_err = False, msg
+                wait_extra = 30.0 if isinstance(e, PermissionError) else min(max(wait_extra * 2, 2.0), 30.0)
+            if self.fast and self.ok:
+                self.fast = False                   # report a command's outcome promptly
+                self.stop_evt.wait(0.3)
+            else:
+                self.stop_evt.wait(max(0.2, self.interval - (time.time() - t0)) + wait_extra)
+
+    def stop(self):
+        self.stop_evt.set()
+
+
+def run_node(a):
+    """Headless node: capture as usual, push to the collector, never serve a UI."""
+    token = a.token
+    if a.token_file:
+        try:
+            with open(a.token_file) as f:
+                token = f.read().strip()
+        except OSError as e:
+            sys.exit("ERROR: --token-file: %s" % e)
+    token = token or os.environ.get("PTP_NODE_TOKEN", "").strip()
+    if not a.collector_url:
+        sys.exit("ERROR: --mode node needs --collector-url https://collector:8443")
+    if not token:
+        sys.exit("ERROR: --mode node needs the node token: --token-file FILE, the "
+                 "PTP_NODE_TOKEN environment variable, or --token")
+    if not a.interface:
+        sys.exit("ERROR: --mode node has no web UI to choose interfaces in: "
+                 "give at least one -i INTERFACE")
+    try:
+        pusher = NodePusher(a.collector_url, token, a.push_interval, a.collector_ca,
+                            a.collector_fingerprint, a.insecure_skip_verify,
+                            a.status_file, not a.no_remote_control)
+    except (ValueError, OSError, ssl.SSLError) as e:
+        sys.exit("ERROR: %s" % e)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    pusher.start()
+    log("PTP Monitor node: capturing on %s, sending to https://%s:%d%s"
+        % (", ".join(a.interface), pusher.host, pusher.port,
+           "" if pusher.allow_control else " (remote control off)"))
+    try:
+        while True:
+            if not CAP.running:                  # e.g. the interface was not up yet
+                res = CAP.start(a.interface)
+                for e in res.get("errors", []):
+                    log("ERROR: %s" % e, True)
+                if CAP.running and a.join_domain is not None:
+                    r = SLAVE.start_from_request(dict(domain=a.join_domain,
+                                                      iface=a.interface[0], ttl=a.ttl))
+                    if not r.get("ok"):
+                        log("ERROR: %s" % r.get("error"), True)
+            time.sleep(15 if not CAP.running else 5)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        pusher.stop()
+        CAP.stop()
+
+
+# ---- collector start-up and account tools ----------------------------------------
+def collector_account_tools(a, store):
+    """--add-user / --set-password / --add-node / --rotate-node: work on the data
+    directory and exit.  A running collector picks the changes up within a second."""
+    import getpass
+    did = False
+    try:
+        if a.add_user:
+            pw = os.environ.get("PTP_NEW_PASSWORD") or getpass.getpass(
+                "Password for new user '%s': " % a.add_user)
+            if not os.environ.get("PTP_NEW_PASSWORD") and getpass.getpass("Repeat: ") != pw:
+                sys.exit("ERROR: the passwords differ")
+            name = store.add_user(a.add_user, pw, a.role)
+            print("User '%s' created (%s)." % (name, a.role))
+            did = True
+        if a.set_password:
+            name = store.norm_user(a.set_password)
+            pw = os.environ.get("PTP_NEW_PASSWORD") or getpass.getpass(
+                "New password for '%s': " % name)
+            if not os.environ.get("PTP_NEW_PASSWORD") and getpass.getpass("Repeat: ") != pw:
+                sys.exit("ERROR: the passwords differ")
+            store.set_password(name, pw)
+            print("Password for '%s' changed." % name)
+            did = True
+        if a.add_node:
+            tok = store.add_node(a.add_node, "command line")
+            print("Node '%s' added. Its token (shown only now):\n\n  %s\n" % (a.add_node, tok))
+            did = True
+        if a.rotate_node:
+            tok = store.rotate_node(a.rotate_node)
+            print("New token for node '%s' (shown only now; the old one stopped working):"
+                  "\n\n  %s\n" % (a.rotate_node, tok))
+            did = True
+    except ValueError as e:
+        sys.exit("ERROR: %s" % e)
+    return did
+
+
+def run_collector(a):
+    data_dir = a.data_dir or os.environ.get("PTP_DATA_DIR") or "ptp_collector_data"
+    store = CollectorStore(data_dir, a.session_hours)
+    if collector_account_tools(a, store):
+        return
+    global STORE
+    STORE = store
+    if not store.has_users():
+        pw = a.admin_password or os.environ.get("PTP_ADMIN_PASSWORD")
+        generated = not pw
+        pw = pw or secrets.token_urlsafe(12)
+        try:
+            store.add_user("admin", pw, "admin", must_change=generated)
+        except ValueError as e:
+            sys.exit("ERROR: first admin account: %s" % e)
+        if generated:
+            print("\n" + "=" * 64 +
+                  "\n  First start: created the user  admin  with the password\n\n"
+                  "      %s\n\n  You must change it at the first login. It is not shown again."
+                  "\n" % pw + "=" * 64 + "\n", flush=True)
+        else:
+            log("First start: created the user 'admin' with the password you supplied.")
+    host = a.host or "0.0.0.0"
+    try:
+        ctx, cert, self_signed = prepare_tls(data_dir, a.cert, a.key, host, a.tls_san)
+    except (RuntimeError, ValueError) as e:
+        sys.exit("ERROR: %s" % e)
+    CFG["self_signed"] = self_signed
+    try:
+        CFG["fingerprint"] = _cert_fingerprint(cert)
+    except Exception:
+        CFG["fingerprint"] = None
+    port = a.port if a.port is not None else 8443
+    TLSServer.tls_context = ctx
+    try:
+        srv = TLSServer((host, port), CollectorHandler)
+    except OSError as e:
+        sys.exit("ERROR: cannot listen on %s:%d (%s)" % (host, port, e))
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    print("PTP Monitor collector: https://%s:%d   (data directory: %s)"
+          % ("localhost" if host in ("0.0.0.0", "::", "") else host, port, os.path.abspath(data_dir)))
+    print("Certificate: %s%s\nSHA-256 fingerprint: %s"
+          % (cert, " (self-signed)" if self_signed else "", CFG["fingerprint"]), flush=True)
+    try:
+        srv.serve_forever()
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        srv.server_close()
+
+
+# ---- collector pages ---------------------------------------------------------
+# The node dashboard is the standalone PAGE itself (see _node_page); the pages
+# below are the collector's own: login, node overview, admin and account.
+COLLECTOR_CSS = r"""
+:root{--bg:#f6f6f4;--card:#fff;--text:#1f1f1d;--muted:#6b6b66;--line:#e2e1dc;--accent:#185FA5;--ok:#1D9E75;--warn:#BA7517;--bad:#E24B4A;--onfill:#fff;color-scheme:light}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#161615;--card:#212120;--text:#ececea;--muted:#9b9a94;--line:#3a3a37;--accent:#5aa2e6;--ok:#3cc29a;--warn:#e0a03c;--bad:#f06a69;--onfill:#10110f;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#161615;--card:#212120;--text:#ececea;--muted:#9b9a94;--line:#3a3a37;--accent:#5aa2e6;--ok:#3cc29a;--warn:#e0a03c;--bad:#f06a69;--onfill:#10110f;color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}
+main{max-width:1400px;margin:0 auto;padding:16px}
+h1{font-size:20px;margin:0 0 2px}h2{font-size:15px;margin:0 0 10px}h3{font-size:13px;margin:14px 0 6px}
+a{color:var(--accent)}
+.sub{color:var(--muted);margin-bottom:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:14px}
+.nav{display:flex;gap:16px;align-items:center;flex-wrap:wrap;padding:10px 16px;background:var(--card);border-bottom:1px solid var(--line)}
+.nav a{text-decoration:none}.nav .grow{flex:1}.nav .sub{margin:0}
+button{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:8px;padding:6px 14px;cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:var(--onfill)}
+button.danger{color:var(--bad);border-color:var(--bad)}
+button.small{padding:2px 9px;font-size:12px}
+button:disabled{opacity:.45;cursor:default}
+input,select{font:inherit;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}
+label{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--muted)}
+.tools{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:10px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 14px}
+.kpi b{display:block;font-size:22px;font-weight:600}.kpi span{color:var(--muted);font-size:12px}
+.tw{overflow:auto}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{text-align:left;padding:6px 10px;border-bottom:1px solid var(--line);white-space:nowrap;vertical-align:top}
+th{color:var(--muted);font-weight:500}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+.mono,code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+.pill{display:inline-block;padding:0 8px;border-radius:9px;font-size:12px;border:1px solid var(--line)}
+.pill.ok{background:var(--ok);color:var(--onfill);border-color:var(--ok)}
+.pill.warn{background:var(--warn);color:var(--onfill);border-color:var(--warn)}
+.pill.bad{background:var(--bad);color:var(--onfill);border-color:var(--bad)}
+.pill.muted{color:var(--muted)}
+.msg{color:var(--bad);margin-top:6px;white-space:pre-line}.msg.ok{color:var(--ok)}
+.empty{color:var(--muted);padding:12px 4px}
+.tokbox{border:1px solid var(--warn);border-left-width:4px;border-radius:8px;padding:10px 14px;margin:0 0 12px;background:var(--bg)}
+.tokbox code{display:block;word-break:break-all;margin:6px 0;font-size:13px;user-select:all}
+.tokbox pre{margin:6px 0 0;padding:8px;overflow:auto;background:var(--card);border:1px solid var(--line);border-radius:6px;font-size:12px}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--card)}
+.seg button{border:0;border-radius:0;padding:3px 10px;font-size:12px;background:transparent;color:var(--muted)}
+.seg button+button{border-left:1px solid var(--line)}
+.seg button[aria-pressed="true"]{background:var(--accent);color:var(--onfill)}
+dialog{border:1px solid var(--line);border-radius:12px;background:var(--card);color:var(--text);padding:18px;min-width:300px;max-width:92vw}
+dialog::backdrop{background:rgba(0,0,0,.45)}
+dialog label{margin:8px 0}
+.login{max-width:360px;margin:12vh auto 0;padding:0 16px}
+.login .card{padding:20px}.login label{margin-bottom:12px}.login input{width:100%}
+"""
+
+COMMON_JS = r"""
+const $=id=>document.getElementById(id);
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const ago=s=>s==null?'-':s<2?'now':s<120?Math.floor(s)+' s ago':s<7200?Math.floor(s/60)+' min ago':s<172800?Math.floor(s/3600)+' h ago':Math.floor(s/86400)+' d ago';
+const dateStr=t=>t?new Date(t*1000).toLocaleString():'-';
+async function post(path,body){
+  const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+  if(r.status===401){location.href='/login';throw new Error('login required')}
+  let d={};try{d=await r.json()}catch(e){}
+  d._status=r.status;return d}
+async function getj(path){
+  const r=await fetch(path);
+  if(r.status===401){location.href='/login';throw new Error('login required')}
+  return r.json()}
+$('logout').onclick=async()=>{try{await post('/api/logout')}catch(e){}location.href='/login'};
+function themePref(){try{const t=localStorage.getItem('ptpTheme');return t==='light'||t==='dark'?t:'system'}catch(e){return 'system'}}
+function applyTheme(t,save){
+  const root=document.documentElement;
+  if(t==='light'||t==='dark')root.dataset.theme=t;else delete root.dataset.theme;
+  if(save){try{t==='system'?localStorage.removeItem('ptpTheme'):localStorage.setItem('ptpTheme',t)}catch(e){}}
+  document.querySelectorAll('[data-theme-set]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.themeSet===t)));
+}
+document.querySelectorAll('[data-theme-set]').forEach(b=>b.onclick=()=>applyTheme(b.dataset.themeSet,true));
+applyTheme(themePref(),false);
+// small modal: fields = [{type:'note'|'text'|'password'|'select', label, text, options}] -> values or null
+function ask(title,fields,ok,danger){return new Promise(res=>{
+  const d=$('dlg');$('dlgT').textContent=title;
+  $('dlgB').innerHTML=fields.map((f,i)=>f.type==='note'?`<p>${esc(f.text)}</p>`
+    :f.type==='select'?`<label>${esc(f.label)}<select id="df${i}">${f.options.map(o=>`<option>${esc(o)}</option>`).join('')}</select></label>`
+    :`<label>${esc(f.label)}<input id="df${i}" type="${f.type||'text'}" autocomplete="${f.type==='password'?'new-password':'off'}"></label>`).join('');
+  $('dlgOk').textContent=ok||'OK';$('dlgOk').className=danger?'danger':'primary';
+  d.returnValue='';
+  d.onclose=()=>res(d.returnValue==='ok'?fields.map((f,i)=>f.type==='note'?null:$('df'+i).value):null);
+  d.showModal();const f0=$('df0');if(f0)f0.focus();
+})}
+"""
+
+SHELL = (r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>@@TITLE@@ &ndash; PTP Monitor collector</title>
+<style>@@CSS@@</style>
+<script>try{const t=localStorage.getItem('ptpTheme');if(t==='light'||t==='dark')document.documentElement.dataset.theme=t}catch(e){}</script>
+</head><body>
+<nav class="nav"><b>PTP Monitor</b><span class="sub">collector</span>
+  <a href="/">Nodes</a>@@NAV_ADMIN@@<a href="/account">Account</a><span class="grow"></span>
+  <span class="sub">@@USER@@</span>
+  <div class="seg" role="group" aria-label="Colour theme">
+    <button data-theme-set="system">System</button><button data-theme-set="light">Light</button><button data-theme-set="dark">Dark</button></div>
+  <button id="logout" class="small">Log out</button></nav>
+<main>@@BODY@@</main>
+<dialog id="dlg"><form method="dialog"><h3 id="dlgT" style="margin-top:0"></h3><div id="dlgB"></div>
+  <div class="tools" style="margin:12px 0 0;justify-content:flex-end"><button value="cancel" formnovalidate>Cancel</button><button id="dlgOk" value="ok" class="primary">OK</button></div></form></dialog>
+<script>const ROLE=@@ROLE@@;
+""" + COMMON_JS + r"""</script>
+<script>@@SCRIPT@@</script>
+</body></html>
+""").replace("@@CSS@@", COLLECTOR_CSS)
+
+NOTICE = '<div class="card"><p style="margin:0">%s</p></div>'
+
+LOGIN_PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Log in &ndash; PTP Monitor collector</title>
+<style>@@CSS@@</style>
+<script>try{const t=localStorage.getItem('ptpTheme');if(t==='light'||t==='dark')document.documentElement.dataset.theme=t}catch(e){}</script>
+</head><body><div class="login">
+<h1>PTP Monitor</h1><div class="sub">Collector &ndash; log in</div>
+<form class="card" id="f" autocomplete="on">
+  <label>User name<input id="u" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus></label>
+  <label>Password<input id="p" name="password" type="password" autocomplete="current-password" required></label>
+  <button class="primary" id="go" style="width:100%">Log in</button>
+  <div id="msg" class="msg"></div>
+</form></div>
+<script>
+const $=id=>document.getElementById(id);
+$('f').onsubmit=async e=>{
+  e.preventDefault();$('go').disabled=true;$('msg').textContent='';
+  try{
+    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({username:$('u').value,password:$('p').value})});
+    const d=await r.json().catch(()=>({}));
+    if(r.ok&&d.ok){location.href=d.must_change?'/account':'/';return}
+    $('msg').textContent=d.error||('Login failed (HTTP '+r.status+')');
+  }catch(x){$('msg').textContent='Cannot reach the collector.'}
+  $('go').disabled=false;$('p').value='';$('p').focus();
+};
+</script></body></html>
+""".replace("@@CSS@@", COLLECTOR_CSS)
+
+FLEET_BODY = r"""
+<h1>Nodes</h1>
+<div class="sub">Each node captures PTP traffic on its own network and sends it here. Open a node for its full dashboard.</div>
+<div class="kpis">
+  <div class="kpi"><b id="kNodes">0</b><span>nodes</span></div>
+  <div class="kpi"><b id="kOnline">0</b><span>online</span></div>
+  <div class="kpi"><b id="kRate">0</b><span>PTP messages / sec (all nodes)</span></div>
+  <div class="kpi"><b id="kHosts">0</b><span>hosts sending Sync (all nodes)</span></div>
+</div>
+<div class="card"><div class="tw"><table><thead><tr>
+  <th>Node</th><th>Status</th><th>Last data</th><th>Capturing on</th><th>Grandmaster(s)</th>
+  <th class="num">Hosts sending Sync</th><th class="num">PTP msgs/s</th><th class="num">Total messages</th><th>Reporting host</th>
+</tr></thead><tbody id="rows"></tbody></table></div><div id="empty" class="empty"></div></div>
+<div id="err" class="msg"></div>
+"""
+
+FLEET_JS = r"""
+function status(n){
+  if(!n.seen)return ['muted','never connected'];
+  if(!n.online)return ['bad','offline'];
+  if(!n.running)return ['warn','capture stopped'];
+  return ['ok','online'];
+}
+function draw(list){
+  $('kNodes').textContent=list.length;
+  $('kOnline').textContent=list.filter(n=>n.online).length;
+  $('kRate').textContent=list.filter(n=>n.online).reduce((a,n)=>a+n.rate,0).toFixed(1);
+  $('kHosts').textContent=list.filter(n=>n.online).reduce((a,n)=>a+n.hosts,0);
+  $('rows').innerHTML=list.map(n=>{
+    const [c,t]=status(n);
+    const gms=n.gms.length?n.gms.map(g=>`<div class="mono">domain ${esc(g.domain)}: ${esc(g.src)}</div>`).join(''):'-';
+    return `<tr><td><a href="/node/${encodeURIComponent(n.name)}"><b>${esc(n.name)}</b></a></td>
+      <td><span class="pill ${c}">${t}</span></td><td>${n.seen?ago(n.age):'-'}</td>
+      <td>${n.active.length?esc(n.active.join(', ')):'-'}</td><td>${gms}</td>
+      <td class="num">${n.seen?n.hosts:'-'}</td><td class="num">${n.seen?n.rate.toFixed(1):'-'}</td>
+      <td class="num">${n.seen?n.total.toLocaleString():'-'}</td>
+      <td>${n.seen?esc(n.host||'')+(n.remote?` <small class="sub">${esc(n.remote)}</small>`:''):'-'}</td></tr>`}).join('');
+  $('empty').innerHTML=list.length?'':(ROLE==='admin'?'No nodes yet. Add one on the <a href="/admin">Admin</a> page.':'No nodes have been set up yet. Ask an admin to add one.');
+}
+async function load(){
+  try{draw(await getj('/api/nodes'));$('err').textContent=''}
+  catch(e){if(String(e.message).indexOf('login')<0)$('err').textContent='Lost connection to the collector.'}
+}
+load();setInterval(load,2000);
+"""
+
+ACCOUNT_BODY = r"""
+<h1>Account</h1><div class="sub" id="who"></div>
+<div id="force" class="card" style="display:none;border-color:var(--warn)">You must choose a new password before you can use the collector.</div>
+<div class="card" style="max-width:420px"><h2>Change password</h2>
+  <form id="f" class="tools" style="flex-direction:column;align-items:stretch">
+    <label>Current password<input id="cur" type="password" autocomplete="current-password" required></label>
+    <label>New password (at least 10 characters)<input id="nw" type="password" autocomplete="new-password" required minlength="10"></label>
+    <label>New password again<input id="nw2" type="password" autocomplete="new-password" required></label>
+    <div><button class="primary" id="go">Change password</button></div>
+    <div id="msg" class="msg"></div></form></div>
+"""
+
+ACCOUNT_JS = r"""
+getj('/api/me').then(m=>{
+  $('who').textContent='Logged in as '+m.user+' ('+m.role+')';
+  $('force').style.display=m.must_change?'block':'none';
+});
+$('f').onsubmit=async e=>{
+  e.preventDefault();const m=$('msg');m.className='msg';m.textContent='';
+  if($('nw').value!==$('nw2').value){m.textContent='The new passwords differ';return}
+  $('go').disabled=true;
+  const r=await post('/api/account/password',{current:$('cur').value,new:$('nw').value});
+  $('go').disabled=false;
+  if(r.ok){m.className='msg ok';m.textContent='Password changed.';$('f').reset();$('force').style.display='none';
+    setTimeout(()=>location.href='/',900)}
+  else m.textContent=r.error||'Failed';
+};
+"""
+
+ADMIN_BODY = r"""
+<h1>Administration</h1>
+<div class="sub">Nodes send their data to this collector with a token. Users log in to look at it.</div>
+
+<div class="card"><h2>Nodes</h2>
+  <div class="tools">
+    <label>New node name<input id="nName" maxlength="64" placeholder="e.g. lab-switch-3" autocomplete="off" spellcheck="false"></label>
+    <button id="nAdd" class="primary">Add node</button><span id="nMsg" class="msg" style="margin:0"></span></div>
+  <div id="tok" class="tokbox" style="display:none"></div>
+  <div class="tw"><table><thead><tr><th>Node</th><th>Status</th><th>Last data</th><th>Reporting from</th><th>Added</th><th></th></tr></thead>
+    <tbody id="nRows"></tbody></table></div><div id="nEmpty" class="empty"></div></div>
+
+<div class="card"><h2>Users</h2>
+  <div class="tools">
+    <label>User name<input id="uName" maxlength="64" autocomplete="off" autocapitalize="none" spellcheck="false"></label>
+    <label>Initial password (10+ characters)<input id="uPw" type="password" autocomplete="new-password"></label>
+    <label>Role<select id="uRole"><option value="viewer">viewer &ndash; can look</option><option value="admin">admin &ndash; can manage</option></select></label>
+    <button id="uAdd" class="primary">Add user</button><span id="uMsg" class="msg" style="margin:0"></span></div>
+  <div class="sub" style="margin:0 0 8px;font-size:12px">A new user, or one whose password you reset, must choose their own password at the next login.</div>
+  <div class="tw"><table><thead><tr><th>User</th><th>Role</th><th>Added</th><th></th></tr></thead><tbody id="uRows"></tbody></table></div></div>
+<div id="err" class="msg"></div>
+"""
+
+ADMIN_JS = r"""
+let INFO={};
+function setMsg(id,t,ok){const e=$(id);e.className='msg'+(ok?' ok':'');e.textContent=t||''}
+function showToken(name,token){
+  const url='https://'+location.host;
+  const fp=INFO.self_signed&&INFO.fingerprint?' \\\n  --collector-fingerprint '+INFO.fingerprint:'';
+  const cmd="echo '"+token+"' > node.token && chmod 600 node.token\n"+
+    'sudo python3 ptp_monitor.py --mode node -i eth1 \\\n  --collector-url '+url+' --token-file node.token'+fp;
+  const b=$('tok');b.style.display='block';
+  b.innerHTML='Token for <b>'+esc(name)+'</b> &ndash; copy it now, it is shown only once:<code>'+esc(token)+'</code>'+
+    '<button class="small" id="cp">Copy token</button>'+
+    '<div style="margin-top:8px">Start the node (replace <code style="display:inline">eth1</code> with its PTP interface):</div><pre>'+esc(cmd)+'</pre>'+
+    (INFO.self_signed?'<div class="sub" style="margin:6px 0 0;font-size:12px">The collector uses a self-signed certificate, so the node pins its fingerprint. With your own certificate use <code style="display:inline">--collector-ca</code> instead, or nothing if it is publicly trusted.</div>':'');
+  $('cp').onclick=async()=>{try{await navigator.clipboard.writeText(token);$('cp').textContent='Copied'}catch(e){$('cp').textContent='Select the token and copy it'}};
+  b.scrollIntoView({block:'nearest'});
+}
+async function loadNodes(){
+  const list=await getj('/api/nodes');
+  $('nRows').innerHTML=list.map(n=>{
+    const c=!n.seen?['muted','never connected']:!n.online?['bad','offline']:!n.running?['warn','capture stopped']:['ok','online'];
+    return `<tr><td><a href="/node/${encodeURIComponent(n.name)}"><b>${esc(n.name)}</b></a></td>
+      <td><span class="pill ${c[0]}">${c[1]}</span></td><td>${n.seen?ago(n.age):'-'}</td>
+      <td>${n.seen?esc((n.host||'')+(n.remote?' ('+n.remote+')':'')):'-'}</td><td>${dateStr(n.created)}</td>
+      <td><button class="small" data-act="rotate" data-n="${esc(n.name)}">New token</button>
+          <button class="small danger" data-act="del" data-n="${esc(n.name)}">Remove</button></td></tr>`}).join('');
+  $('nEmpty').textContent=list.length?'':'No nodes yet.';
+}
+async function loadUsers(){
+  const list=await getj('/api/admin/users');
+  $('uRows').innerHTML=list.map(u=>`<tr><td><b>${esc(u.name)}</b>${u.must_change?' <span class="pill warn">must change password</span>':''}</td>
+    <td>${esc(u.role)}</td><td>${dateStr(u.created)}</td>
+    <td><button class="small" data-act="pw" data-u="${esc(u.name)}">Reset password</button>
+        <button class="small" data-act="role" data-u="${esc(u.name)}" data-r="${esc(u.role)}">Make ${u.role==='admin'?'viewer':'admin'}</button>
+        <button class="small danger" data-act="udel" data-u="${esc(u.name)}">Delete</button></td></tr>`).join('');
+}
+$('nAdd').onclick=async()=>{
+  setMsg('nMsg','');const name=$('nName').value.trim();if(!name){return}
+  const r=await post('/api/admin/nodes',{name});
+  if(r.ok){$('nName').value='';showToken(r.name,r.token);loadNodes()}else setMsg('nMsg',r.error||'Failed');
+};
+$('nRows').onclick=async e=>{
+  const b=e.target.closest('button');if(!b)return;const n=b.dataset.n;
+  if(b.dataset.act==='rotate'){
+    if(!await ask('New token for '+n,[{type:'note',text:'The current token stops working at once; the node needs the new one.'}],'Create new token'))return;
+    const r=await post('/api/admin/nodes/'+encodeURIComponent(n)+'/rotate');
+    if(r.ok){showToken(r.name,r.token);loadNodes()}else setMsg('nMsg',r.error||'Failed');
+  }else if(b.dataset.act==='del'){
+    if(!await ask('Remove '+n+'?',[{type:'note',text:'The node is disconnected and its data is dropped from the collector.'}],'Remove',true))return;
+    const r=await post('/api/admin/nodes/'+encodeURIComponent(n)+'/delete');
+    if(r.ok){$('tok').style.display='none';loadNodes()}else setMsg('nMsg',r.error||'Failed');
+  }
+};
+$('uAdd').onclick=async()=>{
+  setMsg('uMsg','');
+  const r=await post('/api/admin/users',{username:$('uName').value,password:$('uPw').value,role:$('uRole').value});
+  if(r.ok){$('uName').value='';$('uPw').value='';setMsg('uMsg','User '+r.username+' added.',true);loadUsers()}
+  else setMsg('uMsg',r.error||'Failed');
+};
+$('uRows').onclick=async e=>{
+  const b=e.target.closest('button');if(!b)return;const u=b.dataset.u,base='/api/admin/users/'+encodeURIComponent(u);
+  let r;
+  if(b.dataset.act==='pw'){
+    const v=await ask('New password for '+u,[{type:'password',label:'New password (10+ characters)'}],'Reset password');if(!v)return;
+    r=await post(base+'/password',{password:v[0]});
+  }else if(b.dataset.act==='role'){
+    r=await post(base+'/role',{role:b.dataset.r==='admin'?'viewer':'admin'});
+  }else if(b.dataset.act==='udel'){
+    if(!await ask('Delete '+u+'?',[{type:'note',text:'The user is logged out and cannot log in again.'}],'Delete',true))return;
+    r=await post(base+'/delete');
+  }
+  if(r&&!r.ok)setMsg('uMsg',r.error||'Failed');else setMsg('uMsg','');
+  loadUsers();
+};
+getj('/api/admin/info').then(i=>{INFO=i});
+loadNodes();loadUsers();setInterval(loadNodes,3000);
+"""
+
+# The node dashboard: the standalone page plus these two pieces (see _node_page)
+COLLECTOR_BAR = r"""<style>
+.cbar{display:flex;gap:14px;align-items:center;flex-wrap:wrap;padding:8px 12px;margin-bottom:12px;background:var(--card);border:1px solid var(--line);border-radius:10px}
+.cbar a{color:var(--accent);text-decoration:none}.cbar .grow{flex:1}
+.pill{display:inline-block;padding:0 8px;border-radius:9px;font-size:12px;border:1px solid var(--line)}
+.pill.ok{background:var(--ok);color:var(--onfill);border-color:var(--ok)}
+.pill.warn{background:var(--warn);color:var(--onfill);border-color:var(--warn)}
+.pill.bad{background:var(--bad);color:var(--onfill);border-color:var(--bad)}
+.cban{display:none;margin-bottom:12px;padding:8px 12px;border:1px solid var(--warn);border-left-width:4px;border-radius:8px;background:var(--card)}
+</style>
+<script>window.PTP_NODE=@@NODE@@;window.PTP_USER=@@USER@@;</script>
+<div class="cbar"><a href="/">&larr; All nodes</a><b id="cNode"></b><span id="cPill" class="pill"></span>
+  <span id="cInfo" class="sub" style="margin:0"></span><span class="grow"></span>
+  <a href="/admin" id="cAdmin">Admin</a><a href="/account">Account</a><a href="#" id="cOut">Log out</a></div>
+<div id="cBan" class="cban"></div>
+"""
+
+COLLECTOR_JS = r"""
+(function(){
+  // The capture itself is controlled on the node. What an admin can do from here is
+  // make the node join / leave a PTP domain (the commands travel with the node's pushes).
+  const admin=!!(window.PTP_USER&&window.PTP_USER.role==='admin');
+  ['ifaces','ifHint','bStart','bStop','bClear','bPcap','bRefresh','bBuf','bRejoin','pcapInfo']
+    .forEach(id=>{const e=$(id);if(e)e.style.display='none'});
+  ['showAll','bufMb','mcKeep'].forEach(id=>{const e=$(id);if(e&&e.parentElement)e.parentElement.style.display='none'});
+  if(!admin)document.querySelectorAll('#slaveCard .form,#slaveCard>.sub,#bJoin,#bLeave').forEach(e=>e.style.display='none');
+  const h1=document.querySelector('.card h2');if(h1)h1.textContent='Capture on this node';
+  const h2=document.querySelector('#slaveCard h2');
+  if(h2)h2.textContent=admin?'2. Make this node participate in a PTP domain (optional)':'PTP domain measurement on this node (view only)';
+  const sub=document.querySelector('#slaveCard>.sub');
+  if(sub&&admin)sub.innerHTML='The <b>node</b> acts as a slave-only ordinary clock: it follows the best Announce in the domain, sends a Delay_Req after Sync messages and measures the correction needed to match the master (correction = &minus;offset from master). Measurement only &ndash; the node&rsquo;s clock is never adjusted. The command reaches the node with its next push (a few seconds); the node must be capturing on the chosen interface.';
+  $('cNode').textContent=NODE;
+  if(!window.PTP_USER||window.PTP_USER.role!=='admin')$('cAdmin').style.display='none';
+  $('cOut').onclick=async e=>{e.preventDefault();
+    try{await fetch('/api/logout',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})}catch(x){}
+    location.href='/login'};
+  loadIfaces=async function(){};
+  const baseRender=render;
+  render=function(s){baseRender(s);bar(s);fillIfaces(s);cmdStatus(s)};
+  // the interfaces to choose from are the ones the node is capturing on
+  function fillIfaces(s){
+    const ss=$('sIface'),act=s.active||[],key=act.join(',');
+    if(ss.dataset.opts!==key){const cur=ss.value;
+      ss.innerHTML=act.map(i=>`<option value="${esc(i)}">${esc(i)}</option>`).join('');ss.dataset.opts=key;
+      if(act.includes(cur))ss.value=cur}
+    if(!sIfaceTouched){const c=s.slave&&s.slave.running&&s.slave.cfg&&s.slave.cfg.iface;if(c&&act.includes(c))ss.value=c}
+  }
+  // outcome of the last command sent to the node
+  function cmdStatus(s){
+    const cs=(s.collector&&s.collector.commands)||[];const c=cs[cs.length-1];
+    if(!c||Date.now()/1000-c.ts>120)return;
+    const m=$('sMsg');
+    if(c.status==='queued'||c.status==='sent'){m.className='msg';m.style.color='var(--muted)';m.textContent=c.label+' – sent to the node, waiting for it…'}
+    else if(c.status==='failed'||c.status==='timeout'){m.className='msg';m.style.color='';m.textContent=c.label+' – failed: '+c.error}
+  }
+  function bar(s){
+    const c=s.collector||{},online=!!c.online,age=Math.floor(c.age||0),i=c.info||{};
+    const p=$('cPill');
+    p.className='pill '+(online?(s.running?'ok':'warn'):'bad');
+    p.textContent=online?(s.running?'online':'online – capture stopped'):'offline';
+    $('cInfo').textContent=[i.hostname,c.remote?'from '+c.remote:'',online?'':'last data '+fmtUp(age)+' ago'].filter(Boolean).join(' · ');
+    const b=$('cBan');
+    if(online)b.style.display='none';
+    else{b.style.display='block';b.textContent='This node is not reporting. The dashboard shows its last known state, received '+fmtUp(age)+' ago.'}
+  }
+})();
 """
 
 
@@ -3323,15 +5142,24 @@ def open_browser(url):
 
 def main():
     global CAP
-    ap = argparse.ArgumentParser(description="PTP multicast monitor")
-    ap.add_argument("--host", default="127.0.0.1",
-                    help="web UI bind address (default 127.0.0.1)")
+    ap = argparse.ArgumentParser(
+        description="PTP multicast monitor: standalone (default), or a central "
+                    "collector with remote capture nodes (--mode)")
+    ap.add_argument("--mode", choices=("standalone", "node", "collector"),
+                    default=os.environ.get("PTP_MODE", "standalone"),
+                    help="standalone: capture + web UI in one program (default). "
+                         "node: capture only, no web UI, push the data to a collector. "
+                         "collector: HTTPS web UI with user login showing all nodes "
+                         "(captures nothing)")
+    ap.add_argument("--host", default=None,
+                    help="web UI bind address (default 127.0.0.1; 0.0.0.0 in collector mode)")
     ap.add_argument("--port", type=int, default=None,
                     help="web UI port (default 8080; if that is busy the next "
-                         "free port is used automatically)")
+                         "free port is used automatically). Collector mode: 8443, "
+                         "never changed")
     ap.add_argument("-i", "--interface", action="append", default=[],
                     help="start capturing on this interface immediately "
-                         "(repeatable)")
+                         "(repeatable; required in node mode)")
     ap.add_argument("--bpf", default=DEFAULT_BPF,
                     help="capture filter (default: %(default)s)")
     ap.add_argument("--no-promisc", action="store_true",
@@ -3354,7 +5182,67 @@ def main():
     ap.add_argument("--ttl", type=int, default=1, metavar="N",
                     help="IP TTL (1-255) for Delay_Req packets sent when "
                          "joining a domain (default 1)")
+    g = ap.add_argument_group("node mode (--mode node)")
+    g.add_argument("--collector-url", metavar="URL",
+                   default=os.environ.get("PTP_COLLECTOR_URL"),
+                   help="https://host:8443 of the collector")
+    g.add_argument("--token-file", metavar="FILE",
+                   default=os.environ.get("PTP_NODE_TOKEN_FILE"),
+                   help="file holding this node's token (issued on the collector's "
+                        "Admin page). The PTP_NODE_TOKEN environment variable works too")
+    g.add_argument("--token", metavar="TOKEN", default=None,
+                   help="this node's token (visible in the process list: prefer "
+                        "--token-file)")
+    g.add_argument("--collector-ca", metavar="FILE",
+                   default=os.environ.get("PTP_COLLECTOR_CA"),
+                   help="CA certificate (PEM) that signed the collector's certificate; "
+                        "not needed when it is publicly trusted")
+    g.add_argument("--collector-fingerprint", metavar="SHA256",
+                   default=os.environ.get("PTP_COLLECTOR_FINGERPRINT"),
+                   help="trust only the collector certificate with this SHA-256 "
+                        "fingerprint (for a self-signed certificate; the collector "
+                        "prints it at start-up)")
+    g.add_argument("--insecure-skip-verify", action="store_true",
+                   help="do not verify the collector's certificate at all (not recommended)")
+    g.add_argument("--push-interval", type=float, default=2.0, metavar="SEC",
+                   help="seconds between pushes to the collector (default 2)")
+    g.add_argument("--no-remote-control", action="store_true",
+                   default=os.environ.get("PTP_NO_REMOTE_CONTROL", "0").lower() in ("1", "true", "yes"),
+                   help="do not let the collector make this node join or leave a PTP domain "
+                        "(it can then only be read)")
+    g.add_argument("--status-file", metavar="FILE", default=os.environ.get("PTP_NODE_STATUS_FILE"),
+                   help="touch this file after every push the collector accepted "
+                        "(used by the container health check)")
+    g = ap.add_argument_group("collector mode (--mode collector)")
+    g.add_argument("--cert", metavar="FILE", help="TLS certificate (PEM, may include the "
+                   "chain). Without --cert/--key a self-signed certificate is created in "
+                   "the data directory on the first start")
+    g.add_argument("--key", metavar="FILE", help="TLS private key (PEM)")
+    g.add_argument("--tls-san", action="append", default=[], metavar="NAME",
+                   help="extra DNS name or IP for the self-signed certificate (repeatable)")
+    g.add_argument("--data-dir", metavar="DIR",
+                   help="accounts, node tokens and the generated certificate "
+                        "(default ./ptp_collector_data, or $PTP_DATA_DIR)")
+    g.add_argument("--session-hours", type=float, default=12.0, metavar="H",
+                   help="idle time after which a login expires (default 12)")
+    g.add_argument("--admin-password", metavar="PW", default=None,
+                   help="password of the first 'admin' account (prefer the "
+                        "PTP_ADMIN_PASSWORD environment variable). Without one, a random "
+                        "password is created and printed once, and must be changed")
+    g.add_argument("--add-user", metavar="NAME", help="create a user and exit")
+    g.add_argument("--role", choices=ROLES, default="viewer",
+                   help="role for --add-user (default viewer)")
+    g.add_argument("--set-password", metavar="NAME", help="change a user's password and exit")
+    g.add_argument("--add-node", metavar="NAME", help="register a node, print its token and exit")
+    g.add_argument("--rotate-node", metavar="NAME", help="replace a node's token and exit")
     a = ap.parse_args()
+
+    if a.mode == "collector":
+        return run_collector(a)
+    if not HAVE_SCAPY:
+        sys.exit("This program needs scapy:  pip install scapy")
+    if a.host is None:
+        a.host = "127.0.0.1"
 
     if hasattr(os, "geteuid") and os.geteuid() != 0:
         print("WARNING: not running as root - packet capture and the IGMP "
@@ -3375,6 +5263,8 @@ def main():
     if not r["ok"]:
         sys.exit("ERROR: --buffer-mb: " + r["error"])
     CAP = Capture(a.bpf, not a.no_promisc)
+    if a.mode == "node":
+        return run_node(a)
     if a.interface:
         res = CAP.start(a.interface)
         for e in res.get("errors", []):

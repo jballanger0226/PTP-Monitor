@@ -1,0 +1,28 @@
+# Central collector: HTTPS web UI + user login that shows every node.
+#   docker compose -f docker-compose.collector.yml up -d --build
+#   docker compose -f docker-compose.collector.yml logs      # first-start admin password
+# then open https://<this host>:8443 .  It captures nothing, so no host networking and
+# no extra capabilities are needed.
+services:
+  ptp-collector:
+    build: .
+    image: ptp-monitor:latest
+    # or use the published image:
+    # image: ghcr.io/jballanger0226/ptp-monitor:latest
+    container_name: ptp-collector
+    restart: unless-stopped
+    ports:
+      - "8443:8443"
+    volumes:
+      - ptp-collector-data:/data       # accounts, node tokens, generated certificate
+      # your own certificate (otherwise a self-signed one is created in /data):
+      # - ./certs:/certs:ro
+    environment:
+      PTP_MODE: collector
+      # PTP_ADMIN_PASSWORD: "choose-a-long-password"   # else a random one is printed once in the log
+      # PTP_CERT: /certs/fullchain.pem
+      # PTP_KEY: /certs/privkey.pem
+      # PTP_TLS_SAN: "ptp.example.com,10.1.2.3"        # extra names/IPs for the self-signed certificate
+      # PTP_SESSION_HOURS: "12"
+volumes:
+  ptp-collector-data:

@@ -8,6 +8,7 @@ It can also join a PTP domain as a measurement-only slave and chart the clock co
 - Runs on Linux, macOS and Windows.
 - The web UI is served by the program itself and opens in your browser automatically.
 - It only listens and measures. It never changes this computer's clock.
+- **Standalone or distributed.** By default one program captures and serves its own dashboard. Alternatively, run headless **nodes** at several sites that report to one central **collector** with an HTTPS web UI and user login. See [Collector and nodes](#collector-and-nodes).
 
 ---
 
@@ -18,6 +19,7 @@ It can also join a PTP domain as a measurement-only slave and chart the clock co
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Running in a container](#running-in-a-container)
+- [Collector and nodes](#collector-and-nodes)
 - [Command-line options](#command-line-options)
 - [The dashboard, section by section](#the-dashboard-section-by-section)
 - [Exports](#exports)
@@ -170,6 +172,8 @@ docker pull ghcr.io/jballanger0226/ptp-monitor:latest
 
 The package is private like the repository. Run `docker login ghcr.io` with a token that has `read:packages`, or make the package public in its GitHub settings.
 
+The image runs standalone by default. `PTP_MODE=collector` or `PTP_MODE=node` runs it as a central collector or a headless remote node instead ([Collector and nodes](#collector-and-nodes)); the variables below are for standalone, and the node and collector variables are listed in that section.
+
 **Configuration** is done with environment variables. Any `ptp_monitor.py` option can also be appended after the image name, for example `docker run … ptp-monitor --ttl 16`; later options win.
 
 | Variable | Default | Meaning |
@@ -187,9 +191,131 @@ The package is private like the repository. Run `docker login ghcr.io` with a to
 Notes:
 - **Privileges:** the container runs as root and needs `NET_RAW` (packet capture) and `NET_ADMIN` (promiscuous mode). It does not need `--privileged`.
 - **Access:** the web UI has no authentication and listens on all addresses by default. Put it on a management network, set `PTP_HOST=127.0.0.1`, or firewall the port.
-- **Health:** a health check polls `/api/state` every 30 s (`docker ps` shows *healthy*).
+- **Health:** a health check runs every 30 s (`docker ps` shows *healthy*). Standalone: the web UI answers `/api/state`. The collector and node modes have their own checks, see [Collector and nodes](#collector-and-nodes).
 - **No browser:** the container never tries to open a browser.
 - **Persistence:** all data lives in memory. Download the `.pcap` or CSV from the web UI to keep it.
+
+---
+
+## Collector and nodes
+
+For more than one network, run one **collector** and a **node** at each site instead of a standalone program everywhere.
+
+```
+ site A:  node ──┐   capture + analysis, no web UI,
+ site B:  node ──┼─► outbound HTTPS push (per-node token) ──►  collector  ◄── your browser
+ site C:  node ──┘                                    https://collector:8443  (login)
+```
+
+| | Standalone (default) | Node | Collector |
+|---|---|---|---|
+| Start with | `ptp_monitor.py` | `--mode node` | `--mode collector` |
+| Captures PTP | yes | yes | no |
+| Needs root / scapy / Npcap | yes | yes | **no** |
+| Web UI | HTTP, no login | **none** | **HTTPS, local user login** |
+| Listens on a port | 8080 | **none** (connects out) | 8443 |
+
+Standalone is unchanged: everything described elsewhere in this README still applies to it. The node runs the same capture and analysis, so each node's dashboard on the collector is the **same page** you get standalone (charts, hosts, BMCA ranking, hierarchy, Delay_Req check, IGMP membership, joined-domain measurement), with a bar on top that shows the node and whether it is online. The capture itself (interfaces, start/stop, buffer) is controlled on the node, but an admin can make the node **join a PTP domain** from the collector (see [Joining a PTP domain from the collector](#joining-a-ptp-domain-from-the-collector)).
+
+### Set up the collector
+
+```bash
+python3 ptp_monitor.py --mode collector                  # https://<host>:8443 - no root needed
+python3 ptp_monitor.py --mode collector --cert fullchain.pem --key privkey.pem   # your own certificate
+```
+
+- **Certificate.** With `--cert` and `--key` (PEM) the collector uses your certificate. Without them it creates a **self-signed** one in the data directory on the first start (valid 825 days, for `localhost`, the host name and the host's IP; add more with `--tls-san NAME`, repeatable) and prints its SHA-256 fingerprint. Self-signed creation needs the `cryptography` package (in `requirements.txt`) or the `openssl` command. To renew a self-signed certificate, delete `collector.crt` and `collector.key` from the data directory and restart; nodes that pin the fingerprint then need the new one.
+- **Data directory** (`--data-dir`, default `./ptp_collector_data`, or `$PTP_DATA_DIR`) holds `users.json`, `nodes.json` and the generated certificate and key, all mode `0600`. It contains secrets: back it up, don't commit it. Passwords are stored as scrypt hashes and node tokens as SHA-256 hashes. Everything else (the nodes' data) stays in memory, as in standalone mode.
+- **First start.** The collector creates the user `admin`. If you set `PTP_ADMIN_PASSWORD` (or `--admin-password`) that is its password; otherwise a random one is printed **once** and you must change it at the first login.
+- **Port and address.** Defaults: `0.0.0.0:8443`, never moved to another port (nodes need a fixed one). Change with `--host` / `--port`.
+
+### Users
+
+Log in at `https://<collector>:8443`. Two roles: **viewer** (sees every node) and **admin** (also manages nodes and users on the **Admin** page). Admins add users (the new user must choose their own password at the first login), reset passwords, change roles and delete users. Everyone can change their own password on the **Account** page (at least 10 characters).
+
+From the command line (works while the collector runs; it notices within a second):
+
+```bash
+python3 ptp_monitor.py --mode collector --add-user alice --role viewer     # asks for the password
+python3 ptp_monitor.py --mode collector --set-password alice
+# non-interactive: PTP_NEW_PASSWORD=... python3 ptp_monitor.py --mode collector --add-user alice
+```
+
+Logins last 12 hours of inactivity (`--session-hours`). Repeated failed logins are throttled per address and per user name (HTTP 429).
+
+### Add a node
+
+1. On the collector's **Admin** page, enter a node name and press **Add node**. The **token** is shown once. (Command line: `--mode collector --add-node NAME`; replace a lost or leaked token with **New token** or `--rotate-node NAME`. The old token stops working immediately.)
+2. On the node (Linux/macOS/Windows with scapy, as root/Administrator), save the token to a file and start it:
+
+```bash
+echo 'ptpn_…' > node.token && chmod 600 node.token
+sudo python3 ptp_monitor.py --mode node -i eth1 \
+     --collector-url https://collector.example.com:8443 \
+     --token-file node.token \
+     --collector-fingerprint AA:BB:CC:…      # self-signed collector certificate
+```
+
+The node connects **outbound** only (it works behind NAT and firewalls, and needs no open port), sends its dashboard data every 2 seconds over a kept-alive HTTPS connection, and retries by itself if the collector is unreachable. It also accepts `--join-domain`, `--ttl`, `--bpf`, `--buffer-mb` and the other capture options.
+
+**How a node trusts the collector** (pick one):
+
+| Collector certificate | Node option |
+|---|---|
+| Publicly trusted (for example Let's Encrypt) | none, the system trust store is used |
+| Signed by your own CA | `--collector-ca ca.pem` |
+| Self-signed (the default) | `--collector-fingerprint AA:BB:…` (printed at collector start-up and on the Admin page) |
+| (testing only) | `--insecure-skip-verify` |
+
+The node refuses `http://` URLs, so its token is never sent unencrypted. The token can also be given in the `PTP_NODE_TOKEN` environment variable, which keeps it out of the process list (`--token TOKEN` exists but is visible there).
+
+### Joining a PTP domain from the collector
+
+On a node's dashboard, admins get the same "Participate in a PTP domain" form as in standalone mode (domain, interface, Delay_Req rate, multicast/unicast, TTL, timescale, pinned master). **Join domain** makes the *node* a slave-only ordinary clock in that domain, and the node's measurement shows up on the collector's page exactly as it does standalone: the time the grandmaster gives, the correction and path-delay charts with the mean ± 2σ band, and the statistics table. **Leave** ends it. Viewers see the measurement but not the form.
+
+- The interface list is the interfaces the node is **already capturing on** (the slave needs the capture's packet timestamps), so start the node with `-i` for that interface.
+- A command waits on the collector until the node's next push, which is how it reaches a node that only connects out. Expect the node to join within about one push interval (2 s by default); the page says "sent to the node, waiting" and then shows the result or the error the node reported.
+- Only two commands exist (join and leave), both checked again on the node. A node can refuse them altogether with `--no-remote-control` (`PTP_NO_REMOTE_CONTROL=1`); the form then reports that remote control is switched off. Joining makes the node send Delay_Req packets, so enable it only where that is acceptable.
+- Measurement only: the node's clock is never adjusted, as in standalone mode. A node that restarts is no longer in the domain; give it `--join-domain N` if it should join at every start.
+- The commands and their outcomes are logged on the collector (who told which node to do what) and on the node.
+
+### Reading the collector
+
+- **Nodes** page: one row per node with status (online, offline, capture stopped, never connected), when data last arrived, the interfaces it captures on, the grandmaster per domain, hosts sending Sync and the message rate, plus totals over all online nodes.
+- Click a node for its **full dashboard**. If a node stops reporting, the page keeps showing its last known state with an "offline" banner. A node is offline after missing about three pushes (at least 10 s).
+- The Delay_Req **CSV** download works per node. The `.pcap` download and the capture controls (start, stop, clear, buffer size, IGMP re-join) are **not** available on the collector, because the raw packets stay on the node. For a `.pcap`, open the node's own standalone dashboard or capture on the node.
+- The packet list shows the most recent 200 packets of the node, filtered on the collector.
+
+### Containers
+
+The same image runs all three modes (`PTP_MODE=standalone|node|collector`); see [Running in a container](#running-in-a-container) and the compose files `docker-compose.collector.yml` (port 8443, a `/data` volume, no special privileges) and `docker-compose.node.yml` (host networking, `NET_RAW` + `NET_ADMIN`, no published port).
+
+| Variable | Mode | Meaning |
+|---|---|---|
+| `PTP_MODE` | all | `standalone` (default), `node` or `collector` |
+| `PTP_COLLECTOR_URL` | node | `https://collector:8443` |
+| `PTP_NODE_TOKEN` or `PTP_NODE_TOKEN_FILE` | node | the node's token (or a path to a file holding it, such as a Docker secret) |
+| `PTP_COLLECTOR_FINGERPRINT` / `PTP_COLLECTOR_CA` | node | how to trust the collector's certificate (see above) |
+| `PTP_INTERFACES` | node | interfaces to capture on, e.g. `eth1` (**required**) |
+| `PTP_PUSH_INTERVAL` | node | seconds between pushes (default 2) |
+| `PTP_NO_REMOTE_CONTROL` | node | `1` = the collector may not make this node join a PTP domain |
+| `PTP_HOST` / `PTP_PORT` | collector | bind address and HTTPS port (default `0.0.0.0:8443`) |
+| `PTP_DATA_DIR` | collector | accounts, tokens and generated certificate (default `/data`; keep it on a volume) |
+| `PTP_CERT` / `PTP_KEY` | collector | your own certificate and key (PEM, paths inside the container) |
+| `PTP_TLS_SAN` | collector | extra names/IPs for the self-signed certificate, comma separated |
+| `PTP_ADMIN_PASSWORD` | collector | password of the first `admin` account (else random, printed once in the log) |
+| `PTP_SESSION_HOURS` | collector | idle time before a login expires (default 12) |
+
+The health check follows the mode: the collector answers `/healthz`; a node is healthy while the collector keeps accepting its pushes.
+
+### Security of the collector
+
+- HTTPS only (TLS 1.2 or newer). There is no plain-HTTP listener. The session cookie is `Secure`, `HttpOnly` and `SameSite=Strict`, and the pages are sent with HSTS, a Content-Security-Policy and `X-Frame-Options: DENY`.
+- Sessions are server side: logging out, deleting a user or changing a password ends them at once. POST requests must be JSON from the same origin, which stops other sites from acting on a logged-in browser.
+- A node's name comes from its token, not from what the node says, so one node cannot pose as another. A node can only push data (and receive the join/leave commands an admin sends it); it cannot read anything or log in. Only admins can send those commands, and a node can switch them off with `--no-remote-control`. Treat a node token like a password: whoever has it can send data under that node's name (use **New token** if one leaks). The collector shows what nodes send like any dashboard data, so only register nodes you trust.
+- The collector has no capture endpoints (its only control is the admin-only join/leave command for nodes) and does not need root: run it as an unprivileged user (port 8443 is above 1024).
+- The first-start password, `--admin-password` and `--token` are visible in the process list or logs; prefer the environment variables, a token file and changing the first password at once.
+- Limits: pushes over 8 MB (compressed) or 64 MB (decompressed) are refused.
 
 ---
 
@@ -197,8 +323,9 @@ Notes:
 
 | Option | Default | Description |
 |---|---|---|
-| `--host ADDR` | `127.0.0.1` | Address the web UI listens on. Use `0.0.0.0` to reach it from other machines (see [Security notes](#security-notes)). |
-| `--port N` | `8080` | Web UI port. If you don't give `--port` and 8080 is busy, the next free port (up to 8129) is used. A port you give explicitly is never changed. |
+| `--mode MODE` | `standalone` | `standalone`, `node` or `collector` (see [Collector and nodes](#collector-and-nodes)). Also `PTP_MODE`. |
+| `--host ADDR` | `127.0.0.1` (collector: `0.0.0.0`) | Address the web UI listens on. Use `0.0.0.0` to reach a standalone UI from other machines (see [Security notes](#security-notes)). |
+| `--port N` | `8080` (collector: `8443`) | Web UI port. If you don't give `--port` and 8080 is busy, the next free port (up to 8129) is used. A port you give explicitly is never changed, and the collector never moves. |
 | `-i IFACE`, `--interface IFACE` | – | Start capturing on this interface immediately. Repeatable. |
 | `--bpf FILTER` | `(udp and (port 319 or port 320)) or ether proto 0x88f7 or (ip proto 2)` | Capture filter (BPF syntax). `ip proto 2` is IGMP, needed for the multicast membership check. |
 | `--no-promisc` | off | Do not put the interface into promiscuous mode. |
@@ -207,6 +334,32 @@ Notes:
 | `--ttl N` | `1` | IP TTL (1–255) of the Delay_Req packets sent when joining a domain. |
 | `--no-igmp-keepalive` | off | Do not re-send the IGMP joins when no IGMP querier is seen. It can also be switched off in the page. |
 | `--no-browser` | off | Do not open the dashboard in a browser on start-up. |
+
+**Node mode** (`--mode node`; the capture options above apply, `-i` is required):
+
+| Option | Default | Description |
+|---|---|---|
+| `--collector-url URL` | – | `https://host:8443` of the collector (required; `http://` is refused). |
+| `--token-file FILE` | – | File holding the node's token. `PTP_NODE_TOKEN` in the environment works too. |
+| `--token TOKEN` | – | The token on the command line (visible in the process list; prefer the file). |
+| `--collector-fingerprint SHA256` | – | Trust only the collector certificate with this fingerprint (self-signed certificates). |
+| `--collector-ca FILE` | – | CA certificate (PEM) that signed the collector's certificate. |
+| `--insecure-skip-verify` | off | Do not verify the collector's certificate (testing only). |
+| `--push-interval SEC` | `2` | Seconds between pushes. |
+| `--no-remote-control` | off | Do not let the collector make this node join or leave a PTP domain (also `PTP_NO_REMOTE_CONTROL=1`). |
+
+**Collector mode** (`--mode collector`; no capture options apply):
+
+| Option | Default | Description |
+|---|---|---|
+| `--cert FILE`, `--key FILE` | self-signed | TLS certificate (PEM, may include the chain) and private key. Give both or neither. |
+| `--tls-san NAME` | – | Extra DNS name or IP for the self-signed certificate. Repeatable. |
+| `--data-dir DIR` | `./ptp_collector_data` | Accounts, node tokens, generated certificate. Also `PTP_DATA_DIR`. |
+| `--session-hours H` | `12` | Idle time before a login expires. |
+| `--admin-password PW` | random, printed once | Password of the first `admin` account (prefer `PTP_ADMIN_PASSWORD`). |
+| `--add-user NAME` `[--role admin\|viewer]` | – | Create a user and exit. The password is asked for, or taken from `PTP_NEW_PASSWORD`. |
+| `--set-password NAME` | – | Change a user's password and exit. |
+| `--add-node NAME` / `--rotate-node NAME` | – | Register a node, or replace its token, print the token and exit. |
 
 ---
 
@@ -355,6 +508,8 @@ One memory limit covers everything stored per packet: the raw frames for the .pc
 
 ## HTTP API
 
+This is the API of a **standalone** program. (The collector serves the same `/api/state`, `/api/packets` and `/api/dreq.csv` read-only for each node with a `?node=NAME` parameter, behind the login. Its only control endpoints are the admin-only `POST /api/slave/start` and `/api/slave/stop` (`?node=NAME`), which queue a join/leave for the node.)
+
 The page is driven by a small JSON API, which you can also use from scripts. POST requests must send `Content-Type: application/json`.
 
 | Method | Path | Purpose |
@@ -390,6 +545,7 @@ curl -s -o capture.pcap http://127.0.0.1:8080/api/pcap
 - `--host 0.0.0.0` makes it reachable from the network **without any authentication**. Anyone who can reach the port can start or stop captures, download the capture, and make the host send PTP packets. Only do this on a trusted network.
 - POST requests must be JSON, which stops other web pages in your browser from submitting forms to the API.
 - The program runs as root because packet capture needs it. Under `sudo`, the browser is started as your normal user.
+- Need access from several machines or users? Use a collector (HTTPS, login) rather than `--host 0.0.0.0`: see [Security of the collector](#security-of-the-collector).
 
 ---
 
@@ -400,7 +556,8 @@ curl -s -o capture.pcap http://127.0.0.1:8080/api/pcap
 - **End-to-end delay only.** Peer-to-peer (Pdelay) messages are captured and counted, but are not used for measurements or for the hierarchy.
 - **IPv4 multicast join.** The IGMP join covers the IPv4 groups. IPv6 PTP (FF0x::181) and Layer-2 PTP are captured only if they reach the interface anyway, for example in promiscuous mode or on a span port.
 - **Visibility.** The hierarchy and Delay_Req check only see traffic that reaches the chosen interface(s). Masters on other segments appear as "upstream not visible", and switches with IGMP snooping may hide some traffic.
-- **Memory.** All data lives in memory; nothing is written to disk unless you download it.
+- **Memory.** All data lives in memory; nothing is written to disk unless you download it. (The collector also keeps its accounts and node tokens on disk, and the latest data of each node in memory only, so a collector restart shows nodes empty until their next push.)
+- **Collector view.** It shows each node's latest state, not a history; it has no `.pcap` download and no capture controls (apart from joining/leaving a PTP domain) (see [Reading the collector](#reading-the-collector)). Node data crosses the network only as the dashboard summary plus the latest 200 packets. The node's clock and the collector's clock are not compared: times in tables are the node's.
 
 ---
 
@@ -409,6 +566,13 @@ curl -s -o capture.pcap http://127.0.0.1:8080/api/pcap
 | Problem | What to do |
 |---|---|
 | Container shows no interfaces / no packets | Use `--network host` (`network_mode: host`) and add `NET_RAW` + `NET_ADMIN`. On macOS / Windows Docker Desktop the container can't reach the computer's own Ethernet ports, so run the script directly there. |
+| Node: `Cannot send to the collector (… CERTIFICATE_VERIFY_FAILED …)` | The collector's certificate is not trusted. For a self-signed one, give the node `--collector-fingerprint` (shown at collector start-up and on the Admin page); for your own CA use `--collector-ca`. Also check that the URL's host name is in the certificate (`--tls-san` when the collector creates it). |
+| Node: `the collector refused this node's token (HTTP 401)` | The token is wrong, was replaced (**New token**) or the node was removed. Copy the current token from the Admin page. |
+| Collector: joining a domain says "failed" or "did not confirm" | The message is the node's own answer, for example "Start the capture on eth1 first" or "eth1 has no IPv4 address, cannot send Delay_Req". "The node is offline" means it has stopped pushing. "Remote control is switched off" means the node runs with `--no-remote-control`. |
+| Node: `Connection refused` / timeout | The collector is not running, the URL or port is wrong, or a firewall blocks outbound 8443. The node retries by itself. |
+| Node shows "never connected" or "offline" on the collector | Check the node's console output. A node without a working capture (not root, wrong interface name) still connects but shows "capture stopped". |
+| Forgot the collector's admin password | On the collector host: `python3 ptp_monitor.py --mode collector --data-dir DIR --set-password admin`. |
+| Browser warns about the collector's certificate | Expected with the self-signed default. Use `--cert`/`--key` with a certificate your browsers trust, or accept the warning once after checking the fingerprint. |
 | `This program needs scapy` | Install the requirements for the interpreter you run with `sudo` (see [Installation](#installation)). |
 | `Address already in use` / port busy | Without `--port`, the next free port is used automatically. With an explicit `--port`, pick another one, or find the process: `sudo lsof -nP -iTCP:8080 -sTCP:LISTEN` (often an earlier copy still running). |
 | Browser doesn't open | Open the URL printed in the terminal. Use `--no-browser` on headless systems. |
