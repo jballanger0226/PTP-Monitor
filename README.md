@@ -82,7 +82,7 @@ It can also join a PTP domain as a measurement-only slave and chart the clock co
 | Python | 3.8 or newer |
 | Python packages | `scapy` (required, 2.4.3 or newer), `psutil` (optional, extra way to find interface IP addresses) – see `requirements.txt` |
 | Privileges | Raw packet capture and the IGMP join need **root / Administrator** |
-| Linux | Run with `sudo` (or give Python `CAP_NET_RAW` + `CAP_NET_ADMIN`) |
+| Linux | Run with `sudo` (or give Python `CAP_NET_RAW` + `CAP_NET_ADMIN`). Raspberry Pi: see [docs/RASPBERRY-PI.md](docs/RASPBERRY-PI.md) |
 | macOS | Run with `sudo`. libpcap is built in |
 | Windows | Install **[Npcap](https://npcap.com/)** and run from an **elevated** (Run as administrator) prompt |
 | Browser | Any current browser (Chrome, Edge, Firefox, Safari) |
@@ -311,6 +311,10 @@ The health check follows the mode: the collector answers `/healthz`; a node is h
 ### Running a node on a Catalyst 9300 / 9300X
 
 A node-only image (`Dockerfile.iox`, linux/amd64, small footprint) is provided for Cisco IOS XE Application Hosting. Build it with `iox/build.sh 1.0` and follow [docs/CATALYST-9300.md](docs/CATALYST-9300.md) for the switch configuration, install, collector connectivity and troubleshooting. It has not yet been tested on physical hardware.
+
+### Running on a Raspberry Pi
+
+All three modes run on a Raspberry Pi (64-bit and 32-bit OS), natively as a systemd service (`sudo deploy/raspberry-pi/install.sh --mode standalone|node|collector`) or as the multi-arch container. See [docs/RASPBERRY-PI.md](docs/RASPBERRY-PI.md) for setup per mode, network placement, accuracy notes and troubleshooting.
 
 ### Security of the collector
 

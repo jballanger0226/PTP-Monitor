@@ -36,6 +36,7 @@
 #   PTP_SESSION_HOURS   idle time before a login expires (default 12)
 set -euo pipefail
 
+# PTP_APP / PTP_PYTHON let the same script start a native install (deploy/raspberry-pi).
 APP="${PTP_APP:-/app/ptp_monitor.py}"
 MODE="${PTP_MODE:-standalone}"
 
@@ -82,4 +83,4 @@ case "$MODE" in
     ;;
 esac
 
-exec python "$APP" "${args[@]}" "$@"
+exec "${PTP_PYTHON:-python}" "$APP" "${args[@]}" "$@"

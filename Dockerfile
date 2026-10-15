@@ -27,13 +27,20 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # tcpdump brings libpcap; scapy uses them to compile the capture filter.
 # iproute2 gives the interface helpers an extra way to read addresses.
+# openssl creates the collector's self-signed certificate on CPUs where the
+# 'cryptography' package has no ready-made wheel (e.g. 32-bit Raspberry Pi OS).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends tcpdump iproute2 \
+ && apt-get install -y --no-install-recommends tcpdump iproute2 openssl \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install -r requirements.txt
+# scapy is pure Python and required.  psutil and cryptography are optional and are
+# only installed when a binary wheel exists (arm64 and amd64 have them; 32-bit ARM may
+# not, and building them from source would need a compiler); the program falls back to
+# iproute2 and the openssl tool.
+RUN pip install "scapy>=2.4.3" \
+ && (pip install --only-binary=:all: "psutil>=5.6" || echo "psutil: no wheel, skipped") \
+ && (pip install --only-binary=:all: "cryptography>=3.4" || echo "cryptography: no wheel, using openssl")
 
 COPY ptp_monitor.py docker/entrypoint.sh docker/healthcheck.py ./
 RUN chmod 0755 /app/entrypoint.sh /app/ptp_monitor.py \
