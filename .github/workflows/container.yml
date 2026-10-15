@@ -53,7 +53,8 @@ jobs:
         if: always()
         run: docker logs ptp-collector || true
 
-      # Publish (not for pull requests): linux/amd64 + linux/arm64
+      # Publish (not for pull requests): linux/amd64, linux/arm64 (Raspberry Pi 3/4/5, 64-bit OS)
+      # and linux/arm/v7 (32-bit Raspberry Pi OS)
       - uses: docker/setup-qemu-action@v3
         if: github.event_name != 'pull_request'
       - uses: docker/login-action@v3
@@ -76,7 +77,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -131,3 +132,45 @@ jobs:
           name: ptp-node-iox
           path: ptp-node.tar
           retention-days: 30
+
+  # Raspberry Pi: build and run the image on 64-bit and 32-bit ARM (emulated with QEMU)
+  arm-image:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/arm64, linux/arm/v7]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: ptp-arm:test
+      - name: Which optional packages made it into the image
+        run: |
+          docker run --rm --platform ${{ matrix.platform }} --entrypoint python ptp-arm:test -c \
+            "import platform,scapy;print(platform.machine(),'scapy',scapy.VERSION)
+          for m in ('psutil','cryptography'):
+              try: __import__(m);print(m,'yes')
+              except ImportError: print(m,'no (fallback is used)')"
+      - name: Collector end-to-end test on ARM
+        run: |
+          docker run -d --name arm-collector --platform ${{ matrix.platform }} -e PTP_MODE=collector \
+            -e PTP_ADMIN_PASSWORD=ci-admin-password-1 -p 8443:8443 ptp-arm:test
+          for i in $(seq 90); do curl -sk https://127.0.0.1:8443/healthz && break; sleep 2; done
+          COLLECTOR=https://127.0.0.1:8443 ADMIN_PASSWORD=ci-admin-password-1 \
+            python3 .github/scripts/collector_e2e.py
+      - name: Standalone starts on ARM
+        run: |
+          docker run -d --name arm-standalone --platform ${{ matrix.platform }} \
+            --cap-add NET_RAW --cap-add NET_ADMIN -p 8080:8080 ptp-arm:test
+          for i in $(seq 90); do curl -sf http://127.0.0.1:8080/api/state >/dev/null && ok=1 && break; sleep 2; done
+          test "${ok:-0}" = 1
+      - name: Logs
+        if: always()
+        run: docker logs arm-collector || true; docker logs arm-standalone || true
